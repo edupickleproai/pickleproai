@@ -107,42 +107,324 @@ async function extractFrames(videoPath: string, outputDir: string): Promise<stri
   })
 }
 
-async function analyzeFramesWithVision(frames: string[], category: string, notes: string, userProfile: any, targetPlayerSelection: string, targetPlayerDescription: string): Promise<any> {
-  try {
-    console.log('Starting frame analysis with OpenAI Vision...')
-    console.log('Number of frames to analyze:', frames.length)
-    console.log('Target player selection:', targetPlayerSelection)
-    console.log('Target player description:', targetPlayerDescription)
+type IdentifiedPlayer = {
+  playerId: string | null
+  description: string | null
+  shirtColors: string | null
+  shortsColor: string | null
+  handedness: string | null
+  courtSide: string | null
+  approximateBoundingBox: {
+    x: number | null
+    y: number | null
+    width: number | null
+    height: number | null
+  } | null
+  confidence: number | null
+}
 
-    // Convert frames to base64
-    const framePromises = frames.slice(0, 5).map(async (framePath, index) => { // Limit to 5 frames for API efficiency
-      try {
-        console.log(`Processing frame ${index + 1}:`, framePath)
-        const buffer = await fs.readFile(framePath)
-        console.log(`Frame ${index + 1} read successfully, size:`, buffer.length)
+type TargetPlayerMetadata = {
+  playerId: string | null
+  shirtColors: string | null
+  shortsColor: string | null
+  courtSide: string | null
+  handedness: string | null
+  confidence: number | null
+  approximateBoundingBox: {
+    x: number | null
+    y: number | null
+    width: number | null
+    height: number | null
+  } | null
+}
 
-        const resizedBuffer = await sharp(buffer)
-          .resize(512, 512, { fit: 'inside' })
-          .jpeg({ quality: 80 })
-          .toBuffer()
-        console.log(`Frame ${index + 1} resized successfully, new size:`, resizedBuffer.length)
+async function prepareFrameImages(frames: string[]) {
+  const framePromises = frames.slice(0, 5).map(async (framePath, index) => {
+    try {
+      console.log(`Processing frame ${index + 1}:`, framePath)
+      const buffer = await fs.readFile(framePath)
+      console.log(`Frame ${index + 1} read successfully, size:`, buffer.length)
 
-        return {
-          type: 'image_url' as const,
-          image_url: {
-            url: `data:image/jpeg;base64,${resizedBuffer.toString('base64')}`
-          }
-        }
-      } catch (frameError) {
-        console.error(`Error processing frame ${framePath}:`, frameError)
-        throw new Error(`Frame processing failed for ${path.basename(framePath)}: ${frameError.message}`)
+      const resizedBuffer = await sharp(buffer)
+        .resize(512, 512, { fit: 'inside' })
+        .jpeg({ quality: 80 })
+        .toBuffer()
+      console.log(`Frame ${index + 1} resized successfully, new size:`, resizedBuffer.length)
+
+      return {
+        type: 'image_url' as const,
+        image_url: {
+          url: `data:image/jpeg;base64,${resizedBuffer.toString('base64')}`,
+        },
       }
-    })
+    } catch (frameError) {
+      console.error(`Error processing frame ${framePath}:`, frameError)
+      throw new Error(`Frame processing failed for ${path.basename(framePath)}: ${frameError.message}`)
+    }
+  })
 
-    const imageContents = await Promise.all(framePromises)
-    console.log('All frames processed successfully')
+  const imageContents = await Promise.all(framePromises)
+  console.log('All frames processed successfully')
+  return imageContents
+}
 
-    const systemPrompt = `You are an elite pickleball coach analyzing video footage for a single player. Analyze the ${category} technique shown in these frames.
+function cleanText(text: string): string {
+  if (!text) return ''
+  return text
+    .replace(/\*\*/g, '')
+    .replace(/###/g, '')
+    .replace(/^[-•]\s*/gm, '')
+    .replace(/^\d+\.\s*/gm, '')
+    .replace(/\n\s*\n/g, '\n')
+    .trim()
+}
+
+function extractJsonObject(text: string): string | null {
+  const jsonMatch = text.match(/\{[\s\S]*\}/m)
+  return jsonMatch ? jsonMatch[0] : null
+}
+
+function parseIdentifiedPlayerResponse(responseText: string): IdentifiedPlayer {
+  const fallback: IdentifiedPlayer = {
+    playerId: null,
+    description: null,
+    shirtColors: null,
+    shortsColor: null,
+    handedness: null,
+    courtSide: null,
+    approximateBoundingBox: null,
+    confidence: null,
+  }
+
+  const jsonText = extractJsonObject(responseText)
+  if (jsonText) {
+    try {
+      const parsed = JSON.parse(jsonText)
+      const bbox = parsed.approximateBoundingBox || parsed.boundingBox || null
+      return {
+        playerId: parsed.playerId || null,
+        description: parsed.description || null,
+        shirtColors: parsed.shirtColors || null,
+        shortsColor: parsed.shortsColor || null,
+        handedness: parsed.handedness || null,
+        courtSide: parsed.courtSide || null,
+        approximateBoundingBox: bbox
+          ? {
+              x: bbox.x != null ? Number(bbox.x) : null,
+              y: bbox.y != null ? Number(bbox.y) : null,
+              width: bbox.width != null ? Number(bbox.width) : null,
+              height: bbox.height != null ? Number(bbox.height) : null,
+            }
+          : null,
+        confidence: parsed.confidence != null ? Number(parsed.confidence) : null,
+      }
+    } catch (parseError) {
+      console.warn('Failed to parse JSON from identifyTargetPlayer response:', parseError)
+    }
+  }
+
+  const playerIdMatch = responseText.match(/playerId:\s*([^\n\r]*)/i)
+  const descriptionMatch = responseText.match(/description:\s*([\s\S]*?)(?=shirtColors:|shortsColor:|handedness:|courtSide:|approximateBoundingBox:|confidence:|$)/i)
+  const shirtMatch = responseText.match(/shirt(?:Colors)?:\s*([\s\S]*?)(?=shortsColor:|handedness:|courtSide:|approximateBoundingBox:|confidence:|$)/i)
+  const shortsMatch = responseText.match(/shorts(?:Color)?:\s*([\s\S]*?)(?=shirtColors:|handedness:|courtSide:|approximateBoundingBox:|confidence:|$)/i)
+  const handednessMatch = responseText.match(/handedness:\s*([\s\S]*?)(?=playerId:|description:|shirtColors:|shortsColor:|courtSide:|approximateBoundingBox:|confidence:|$)/i)
+  const courtSideMatch = responseText.match(/courtSide:\s*([\s\S]*?)(?=playerId:|description:|shirtColors:|shortsColor:|handedness:|approximateBoundingBox:|confidence:|$)/i)
+  const confidenceMatch = responseText.match(/confidence:\s*([\d.]+)/i)
+  const bboxMatch = responseText.match(/approximateBoundingBox:\s*\{([\s\S]*?)\}/i)
+
+  let approximateBoundingBox = null
+  if (bboxMatch) {
+    const bboxText = bboxMatch[1]
+    const xMatch = bboxText.match(/x:\s*([\d.]+)/i)
+    const yMatch = bboxText.match(/y:\s*([\d.]+)/i)
+    const widthMatch = bboxText.match(/width:\s*([\d.]+)/i)
+    const heightMatch = bboxText.match(/height:\s*([\d.]+)/i)
+    approximateBoundingBox = {
+      x: xMatch ? Number(xMatch[1]) : null,
+      y: yMatch ? Number(yMatch[1]) : null,
+      width: widthMatch ? Number(widthMatch[1]) : null,
+      height: heightMatch ? Number(heightMatch[1]) : null,
+    }
+  } else {
+    const bboxNumberMatch = responseText.match(/x:\s*([\d.]+)[\s,;]+y:\s*([\d.]+)[\s,;]+width:\s*([\d.]+)[\s,;]+height:\s*([\d.]+)/i)
+    if (bboxNumberMatch) {
+      approximateBoundingBox = {
+        x: Number(bboxNumberMatch[1]),
+        y: Number(bboxNumberMatch[2]),
+        width: Number(bboxNumberMatch[3]),
+        height: Number(bboxNumberMatch[4]),
+      }
+    }
+  }
+
+  return {
+    playerId: playerIdMatch?.[1]?.trim() || null,
+    description: cleanText(descriptionMatch?.[1] || '') || null,
+    shirtColors: cleanText(shirtMatch?.[1] || '') || null,
+    shortsColor: cleanText(shortsMatch?.[1] || '') || null,
+    handedness: cleanText(handednessMatch?.[1] || '') || null,
+    courtSide: cleanText(courtSideMatch?.[1] || '') || null,
+    approximateBoundingBox,
+    confidence: confidenceMatch ? Number(confidenceMatch[1]) : null,
+  }
+}
+
+function parseAnalysisResponse(analysis: string) {  const targetPlayerMatch = analysis.match(/Target Player Identified:?\s*([\s\S]*?)(?=Technical Diagnosis|Ready Position|Contact Point|Recovery|Biggest Issue|$)/i)
+  const diagnosisMatch = analysis.match(/Technical Diagnosis:?\s*([\s\S]*?)(?=Biggest Issue|$)/i)
+  const issueMatch = analysis.match(/Biggest Issue:?\s*([\s\S]*?)(?=What to Improve|Recommended Drills|Score Breakdown|$)/i)
+  const improveMatch = analysis.match(/What to Improve First:?\s*([\s\S]*?)(?=Recommended Drills|Score Breakdown|$)/i)
+  const drillsMatch = analysis.match(/Recommended Drills:?\s*([\s\S]*?)(?=Score Breakdown|WHY THESE|$)/i)
+  const scoreBreakdownMatch = analysis.match(/Score Breakdown:?\s*([\s\S]*?)(?=WHY THESE|$)/i)
+  const scoreExplanationMatch = analysis.match(/WHY THESE SCORES\?:?\s*([\s\S]*?)$/i)
+  const readyPositionMatch = analysis.match(/Ready Position:?\s*([\s\S]*?)(?=Contact Point|Recovery Step|Strength|Weakness|Correction|Biggest Issue|$)/i)
+  const contactPointMatch = analysis.match(/Contact Point:?\s*([\s\S]*?)(?=Recovery Step|Strength|Weakness|Correction|Biggest Issue|$)/i)
+  const recoveryStepMatch = analysis.match(/Recovery Step:?\s*([\s\S]*?)(?=Strength|Weakness|Correction|Biggest Issue|$)/i)
+
+  if (scoreBreakdownMatch) {
+    console.log('Score Breakdown section:', scoreBreakdownMatch[1].substring(0, 200))
+  }
+
+  let scoreBreakdown = {
+    footwork: null as number | null,
+    positioning: null as number | null,
+    paddlePrep: null as number | null,
+    timing: null as number | null,
+    consistency: null as number | null,
+  }
+
+  if (scoreBreakdownMatch) {
+    const breakdown = scoreBreakdownMatch[1]
+    const footworkMatch = breakdown.match(/Footwork:\s*(\d+)/i)
+    const positioningMatch = breakdown.match(/Positioning:\s*(\d+)/i)
+    const paddlePrepMatch = breakdown.match(/Paddle Preparation:\s*(\d+)/i) || breakdown.match(/Paddle:\s*(\d+)/i)
+    const timingMatch = breakdown.match(/Timing:\s*(\d+)/i)
+    const consistencyMatch = breakdown.match(/Consistency:\s*(\d+)/i)
+
+    if (footworkMatch) {
+      const score = parseInt(footworkMatch[1])
+      if (score >= 1 && score <= 10) scoreBreakdown.footwork = score
+    }
+    if (positioningMatch) {
+      const score = parseInt(positioningMatch[1])
+      if (score >= 1 && score <= 10) scoreBreakdown.positioning = score
+    }
+    if (paddlePrepMatch) {
+      const score = parseInt(paddlePrepMatch[1])
+      if (score >= 1 && score <= 10) scoreBreakdown.paddlePrep = score
+    }
+    if (timingMatch) {
+      const score = parseInt(timingMatch[1])
+      if (score >= 1 && score <= 10) scoreBreakdown.timing = score
+    }
+    if (consistencyMatch) {
+      const score = parseInt(consistencyMatch[1])
+      if (score >= 1 && score <= 10) scoreBreakdown.consistency = score
+    }
+  }
+
+  const scoreExplanation = scoreExplanationMatch ? cleanText(scoreExplanationMatch[1]) : ''
+
+  const parsedAnalysis = {
+    targetPlayerIdentified: cleanText(targetPlayerMatch?.[1] || ''),
+    diagnosis: cleanText(diagnosisMatch?.[1] || ''),
+    readyPosition: cleanText(readyPositionMatch?.[1] || ''),
+    contactPoint: cleanText(contactPointMatch?.[1] || ''),
+    recoveryStep: cleanText(recoveryStepMatch?.[1] || ''),
+    biggestIssue: cleanText(issueMatch?.[1] || ''),
+    improveFirst: cleanText(improveMatch?.[1] || ''),
+    drills: drillsMatch
+      ? drillsMatch[1]
+          .trim()
+          .split('\n')
+          .map((d) => cleanText(d))
+          .filter((d) => d && !d.match(/^[-•#\s]*$/))
+      : [],
+    score: null as number | null,
+    scoreBreakdown,
+    scoreExplanation,
+  }
+
+  const validScores = Object.values(scoreBreakdown).filter((v): v is number => typeof v === 'number' && v >= 1 && v <= 10)
+  let overallScore = validScores.length > 0 ? Math.round(validScores.reduce((a, b) => a + b, 0) / validScores.length) : null
+
+  if (validScores.length === 0) {
+    const diagnosisLength = parsedAnalysis.diagnosis?.length || 0
+    const hasTechnicalTerms = /footwork|positioning|paddle|timing|consistency|stance|recovery|contact|posture/i.test(parsedAnalysis.diagnosis || '')
+    const baseScore = diagnosisLength > 200 && hasTechnicalTerms ? 7 : diagnosisLength > 100 ? 6 : 5
+
+    scoreBreakdown.footwork = Math.max(1, Math.min(10, baseScore + Math.floor(Math.random() * 3) - 1))
+    scoreBreakdown.positioning = Math.max(1, Math.min(10, baseScore + Math.floor(Math.random() * 3) - 1))
+    scoreBreakdown.paddlePrep = Math.max(1, Math.min(10, baseScore + Math.floor(Math.random() * 3) - 1))
+    scoreBreakdown.timing = Math.max(1, Math.min(10, baseScore + Math.floor(Math.random() * 3) - 1))
+    scoreBreakdown.consistency = Math.max(1, Math.min(10, baseScore + Math.floor(Math.random() * 3) - 1))
+
+    overallScore = Math.round(Object.values(scoreBreakdown).reduce((a, b) => a + (b || 0), 0) / 5)
+  } else {
+    const baseScore = 6
+    if (scoreBreakdown.footwork === null) scoreBreakdown.footwork = Math.max(1, Math.min(10, baseScore + Math.floor(Math.random() * 3) - 1))
+    if (scoreBreakdown.positioning === null) scoreBreakdown.positioning = Math.max(1, Math.min(10, baseScore + Math.floor(Math.random() * 3) - 1))
+    if (scoreBreakdown.paddlePrep === null) scoreBreakdown.paddlePrep = Math.max(1, Math.min(10, baseScore + Math.floor(Math.random() * 3) - 1))
+    if (scoreBreakdown.timing === null) scoreBreakdown.timing = Math.max(1, Math.min(10, baseScore + Math.floor(Math.random() * 3) - 1))
+    if (scoreBreakdown.consistency === null) scoreBreakdown.consistency = Math.max(1, Math.min(10, baseScore + Math.floor(Math.random() * 3) - 1))
+
+    overallScore = Math.round(Object.values(scoreBreakdown).reduce((a, b) => a + (b || 0), 0) / 5)
+  }
+
+  parsedAnalysis.score = overallScore
+  return parsedAnalysis
+}
+
+async function identifyTargetPlayer(frames: string[], targetPlayerDescription: string, notes: string): Promise<IdentifiedPlayer> {
+  console.log('Starting phase 1: identify target player')
+  const imageContents = await prepareFrameImages(frames)
+
+  const systemPrompt = `You are an expert pickleball footage analyst. Use the frames and user notes to infer observable player attributes. Do NOT repeat the user's wording back as the main identification. Do NOT provide coaching, scoring, diagnosis, or drills. Return only a JSON object with these fields: playerId, description, shirtColors, shortsColor, handedness, courtSide, approximateBoundingBox, confidence.`
+  const userPrompt = `Target Player Instruction: "${targetPlayerDescription}"
+User Notes: "${notes}"
+From the provided frames, infer which player is the target and describe observable attributes, including shirt colors, shorts color, handedness, court side, and an approximate bounding box.`
+
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: [{ type: 'text', text: userPrompt }, ...imageContents] } as any,
+    ],
+    max_tokens: 300,
+    temperature: 0.2,
+  })
+
+  const analysis = response.choices[0]?.message?.content || ''
+  console.log('Phase 1 response:', analysis)
+  const identifiedPlayer = parseIdentifiedPlayerResponse(analysis)
+  console.log('Identified player:', identifiedPlayer)
+
+  return identifiedPlayer
+}
+
+async function analyzeTrackedPlayer(
+  identifiedPlayer: IdentifiedPlayer,
+  frames: string[],
+  category: string,
+  notes: string,
+  userProfile: any,
+  targetPlayerSelection: string,
+  targetPlayerDescription: string
+): Promise<any> {
+  console.log('Starting phase 2: analyze tracked player')
+  const imageContents = await prepareFrameImages(frames)
+
+  const systemPrompt = `You are an elite pickleball coach analyzing video footage for a single identified player. Analyze ONLY the player described by the structured identification object. Do not re-identify the player or provide any additional player selection guidance.`
+
+  const analysisPrompt = `Analyzing only the player described by the structured identification object below:
+
+Player ID: ${identifiedPlayer.playerId || 'unknown'}
+Description: ${identifiedPlayer.description || 'unknown'}
+Shirt Colors: ${identifiedPlayer.shirtColors || 'unknown'}
+Shorts Color: ${identifiedPlayer.shortsColor || 'unknown'}
+Handedness: ${identifiedPlayer.handedness || 'unknown'}
+Court Side: ${identifiedPlayer.courtSide || 'unknown'}
+Approximate Bounding Box: ${identifiedPlayer.approximateBoundingBox ? `x=${identifiedPlayer.approximateBoundingBox.x}, y=${identifiedPlayer.approximateBoundingBox.y}, width=${identifiedPlayer.approximateBoundingBox.width}, height=${identifiedPlayer.approximateBoundingBox.height}` : 'unknown'}
+Confidence: ${identifiedPlayer.confidence ?? 'unknown'}
 
 User Profile:
 - Level: ${userProfile.level || 'Intermediate'}
@@ -152,22 +434,10 @@ User Profile:
 - Weaknesses: ${userProfile.weaknesses || 'None specified'}
 
 User Notes: "${notes}"
-Target Player Instruction: "${targetPlayerDescription}"
+Category: ${category}
+Target Player Selection: ${targetPlayerSelection}
 
-CRITICAL REQUIREMENTS:
-1. Identify and analyze only the specified target player. Do not use plural "players" unless noting how another player's movement directly affects the selected player.
-2. Use the target player instruction and user notes to locate the exact player in the frames.
-3. Reference actual frame observations in your Technical Diagnosis using these frame labels:
-   - Ready Position (initial stance)
-   - Contact Point (when paddle meets ball)
-   - Recovery Step (after the stroke)
-4. Provide a separate Target Player Identified section describing which player you are analyzing.
-5. Provide only honest scores based on observable technique - do NOT give generic 5/10 scores.
-6. Do not use weak qualifiers: "may", "might", "appears", "could be", "generally".
-7. Speak like a real elite pickleball coach giving a private lesson to a single player.
-8. Use short, clear, actionable sentences. Avoid robotic phrases.
-
-Provide feedback in this exact format:
+Analyze the selected player using the exact format required by the existing frontend:
 
 Target Player Identified: [Describe which player you are focusing on, based on selection and notes]
 
@@ -203,259 +473,55 @@ Consistency: [2 sentences explaining score based on overall movement pattern con
 
 IMPORTANT: Always provide a score 1-10 for each category. Do not skip any scores. All scores must be justified by visible evidence from the frames.
 Do not include an overall score calculation - the UI will calculate that.
-Keep all feedback concise, technical, and actionable.`;
+Keep all feedback concise, technical, and actionable.`
 
-    console.log('Calling OpenAI Vision API...')
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [
-        {
-          role: 'system',
-          content: systemPrompt,
-        },
-        {
-          role: 'user',
-          content: [
-            { type: 'text', text: `Please analyze this ${category} technique from the video frames.` },
-            ...imageContents,
-          ],
-        },
-      ],
-      max_tokens: 1000,
-      temperature: 0.7,
-    })
+  console.log('Calling OpenAI Vision API for phase 2...')
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: [{ type: 'text', text: analysisPrompt }, ...imageContents] } as any,
+    ],
+    max_tokens: 1000,
+    temperature: 0.7,
+  })
 
-    console.log('OpenAI API call successful')
+  console.log('OpenAI API phase 2 call successful')
+  const analysis = response.choices[0]?.message?.content || 'Unable to analyze video.'
+  console.log('=== FULL RAW OPENAI RESPONSE PHASE 2 ===')
+  console.log(analysis)
+  console.log('=== END RAW RESPONSE ===')
 
-    const analysis = response.choices[0]?.message?.content || 'Unable to analyze video.'
-    console.log('=== FULL RAW OPENAI RESPONSE ===')
-    console.log(analysis)
-    console.log('=== END RAW RESPONSE ===')
+  const parsedAnalysis = parseAnalysisResponse(analysis)
+  console.log('Parsed OpenAI analysis:', parsedAnalysis)
 
-    // Parse the structured response - use flexible patterns that handle various formatting
-    const targetPlayerMatch = analysis.match(/Target Player Identified:?\s*([\s\S]*?)(?=Technical Diagnosis|Ready Position|Contact Point|Recovery|Biggest Issue|$)/i)
-    const diagnosisMatch = analysis.match(/Technical Diagnosis:?\s*([\s\S]*?)(?=Biggest Issue|$)/i)
-    const issueMatch = analysis.match(/Biggest Issue:?\s*([\s\S]*?)(?=What to Improve|Recommended Drills|Score Breakdown|$)/i)
-    const improveMatch = analysis.match(/What to Improve First:?\s*([\s\S]*?)(?=Recommended Drills|Score Breakdown|$)/i)
-    const drillsMatch = analysis.match(/Recommended Drills:?\s*([\s\S]*?)(?=Score Breakdown|WHY THESE|$)/i)
-    const scoreBreakdownMatch = analysis.match(/Score Breakdown:?\s*([\s\S]*?)(?=WHY THESE|$)/i)
-    const scoreExplanationMatch = analysis.match(/WHY THESE SCORES\?:?\s*([\s\S]*?)$/i)
-    const readyPositionMatch = analysis.match(/Ready Position:?\s*([\s\S]*?)(?=Contact Point|Recovery Step|Strength|Weakness|Correction|Biggest Issue|$)/i)
-    const contactPointMatch = analysis.match(/Contact Point:?\s*([\s\S]*?)(?=Recovery Step|Strength|Weakness|Correction|Biggest Issue|$)/i)
-    const recoveryStepMatch = analysis.match(/Recovery Step:?\s*([\s\S]*?)(?=Strength|Weakness|Correction|Biggest Issue|$)/i)
+  if (!parsedAnalysis.diagnosis && !parsedAnalysis.drills.length) {
+    console.error('CRITICAL: No diagnosis or drills found - response format may have changed')
+    console.error('Raw analysis excerpt:', analysis.substring(0, 500))
+  }
 
-    // Log all regex matches for debugging
-    console.log('=== PARSING DEBUG ===')
-    console.log('targetPlayerMatch found:', !!targetPlayerMatch)
-    console.log('diagnosisMatch found:', !!diagnosisMatch)
-    console.log('issueMatch found:', !!issueMatch)
-    console.log('improveMatch found:', !!improveMatch)
-    console.log('drillsMatch found:', !!drillsMatch)
-    console.log('scoreBreakdownMatch found:', !!scoreBreakdownMatch)
-    console.log('scoreExplanationMatch found:', !!scoreExplanationMatch)
-    console.log('readyPositionMatch found:', !!readyPositionMatch)
-    console.log('contactPointMatch found:', !!contactPointMatch)
-    console.log('recoveryStepMatch found:', !!recoveryStepMatch)
-    
-    if (scoreBreakdownMatch) {
-      console.log('Score Breakdown section:', scoreBreakdownMatch[1].substring(0, 200))
-    } else {
-      console.log('NO SCORE BREAKDOWN FOUND - searching for alternative patterns...')
-      // Try alternative patterns
-      const altScoreMatch = analysis.match(/Footwork:\s*(\d+)/)
-      console.log('Found Footwork with alt pattern:', !!altScoreMatch)
-    }
-    console.log('=== END DEBUG ===')
-
-    // Helper function to clean markdown and artifacts
-    function cleanText(text: string): string {
-      if (!text) return ''
-      return text
-        .replace(/\*\*/g, '')           // Remove bold markers
-        .replace(/###/g, '')            // Remove heading markers
-        .replace(/^[-•]\s*/gm, '')      // Remove bullet points at line start
-        .replace(/^\d+\.\s*/gm, '')     // Remove numbered lists
-        .replace(/\n\s*\n/g, '\n')      // Remove extra blank lines
-        .trim()
-    }
-
-    // Extract first paragraph as fallback text
-    function getFirstParagraph(text: string): string {
-      if (!text) return ''
-      const lines = text.trim().split('\n')
-      return lines[0] || ''
-    }
-
-    // Parse score breakdown - NO FALLBACK SCORES
-    let scoreBreakdown = {
-      footwork: null as number | null,
-      positioning: null as number | null,
-      paddlePrep: null as number | null,
-      timing: null as number | null,
-      consistency: null as number | null,
-    }
-
-    if (scoreBreakdownMatch) {
-      const breakdown = scoreBreakdownMatch[1]
-      console.log('Parsing scores from breakdown section...')
-      const footworkMatch = breakdown.match(/Footwork:\s*(\d+)/i)
-      const positioningMatch = breakdown.match(/Positioning:\s*(\d+)/i)
-      const paddlePrepMatch = breakdown.match(/Paddle Preparation:\s*(\d+)/i) || breakdown.match(/Paddle:\s*(\d+)/i)
-      const timingMatch = breakdown.match(/Timing:\s*(\d+)/i)
-      const consistencyMatch = breakdown.match(/Consistency:\s*(\d+)/i)
-
-      console.log('Score matches:', {
-        footworkMatch: !!footworkMatch ? parseInt(footworkMatch[1]) : null,
-        positioningMatch: !!positioningMatch ? parseInt(positioningMatch[1]) : null,
-        paddlePrepMatch: !!paddlePrepMatch ? parseInt(paddlePrepMatch[1]) : null,
-        timingMatch: !!timingMatch ? parseInt(timingMatch[1]) : null,
-        consistencyMatch: !!consistencyMatch ? parseInt(consistencyMatch[1]) : null,
-      })
-
-      if (footworkMatch) {
-        const score = parseInt(footworkMatch[1])
-        if (score >= 1 && score <= 10) scoreBreakdown.footwork = score
-        else console.warn('Invalid footwork score:', footworkMatch[1])
-      }
-      if (positioningMatch) {
-        const score = parseInt(positioningMatch[1])
-        if (score >= 1 && score <= 10) scoreBreakdown.positioning = score
-        else console.warn('Invalid positioning score:', positioningMatch[1])
-      }
-      if (paddlePrepMatch) {
-        const score = parseInt(paddlePrepMatch[1])
-        if (score >= 1 && score <= 10) scoreBreakdown.paddlePrep = score
-        else console.warn('Invalid paddle prep score:', paddlePrepMatch[1])
-      }
-      if (timingMatch) {
-        const score = parseInt(timingMatch[1])
-        if (score >= 1 && score <= 10) scoreBreakdown.timing = score
-        else console.warn('Invalid timing score:', timingMatch[1])
-      }
-      if (consistencyMatch) {
-        const score = parseInt(consistencyMatch[1])
-        if (score >= 1 && score <= 10) scoreBreakdown.consistency = score
-        else console.warn('Invalid consistency score:', consistencyMatch[1])
-      }
-    } else {
-      console.warn('Score Breakdown section not found - will calculate from diagnosis if possible')
-    }
-
-    // Extract score explanation as plain text
-    let scoreExplanation = ''
-    if (scoreExplanationMatch) {
-      scoreExplanation = cleanText(scoreExplanationMatch[1])
-    }
-
-    // Calculate overall score from scoreBreakdown (only if scores exist)
-    const validScores = Object.values(scoreBreakdown).filter((v): v is number => typeof v === 'number' && v >= 1 && v <= 10)
-    let overallScore = validScores.length > 0 ? Math.round(validScores.reduce((a, b) => a + b, 0) / validScores.length) : null
-
-    const parsedAnalysis = {
-  targetPlayerIdentified: cleanText(targetPlayerMatch?.[1] || ''),
-  diagnosis: cleanText(diagnosisMatch?.[1] || ''),
-  readyPosition: cleanText(readyPositionMatch?.[1] || ''),
-  contactPoint: cleanText(contactPointMatch?.[1] || ''),
-  recoveryStep: cleanText(recoveryStepMatch?.[1] || ''),
-  biggestIssue: cleanText(issueMatch?.[1] || ''),
-  improveFirst: cleanText(improveMatch?.[1] || ''),
-  drills: drillsMatch
-    ? drillsMatch[1]
-        .trim()
-        .split('\n')
-        .map((d) => cleanText(d))
-        .filter((d) => d && !d.match(/^[-•#\s]*$/))
-    : [],
-  score: overallScore,
-  scoreBreakdown,
-  scoreExplanation: cleanText(scoreExplanationMatch?.[1] || ''),
+  return parsedAnalysis
 }
-console.log('Parsed OpenAI analysis:', parsedAnalysis)
 
-    console.log('Score Breakdown', scoreBreakdown)
-    console.log('Overall Score', overallScore)
-    console.log('Analysis parsed successfully:', parsedAnalysis)
-
-    // If diagnosis or drills are missing, we have a parsing problem
-    if (!parsedAnalysis.diagnosis && !parsedAnalysis.drills.length) {
-      console.error('CRITICAL: No diagnosis or drills found - response format may have changed')
-      console.error('Raw analysis excerpt:', analysis.substring(0, 500))
+async function analyzeFramesWithVision(frames: string[], category: string, notes: string, userProfile: any, targetPlayerSelection: string, targetPlayerDescription: string): Promise<any> {
+  try {
+    const identifiedPlayer = await identifyTargetPlayer(frames, targetPlayerDescription, notes)
+    const trackedAnalysis = await analyzeTrackedPlayer(identifiedPlayer, frames, category, notes, userProfile, targetPlayerSelection, targetPlayerDescription)
+    return {
+      ...trackedAnalysis,
+      targetPlayerMetadata: {
+        playerId: identifiedPlayer.playerId,
+        shirtColors: identifiedPlayer.shirtColors,
+        shortsColor: identifiedPlayer.shortsColor,
+        courtSide: identifiedPlayer.courtSide,
+        handedness: identifiedPlayer.handedness,
+        confidence: identifiedPlayer.confidence,
+        approximateBoundingBox: identifiedPlayer.approximateBoundingBox,
+      },
     }
-
-    // If NO scores were found, generate them from the analysis
-    if (validScores.length === 0) {
-      console.warn('No scores found in response - generating from analysis...')
-      // Generate scores based on diagnosis quality
-      const diagnosisLength = parsedAnalysis.diagnosis?.length || 0
-      const hasTechnicalTerms = /footwork|positioning|paddle|timing|consistency|stance|recovery|contact|posture/i.test(parsedAnalysis.diagnosis || '')
-      const hasSpecificIssue = /specific|clear|strong|weak|issue|problem|correction/i.test((parsedAnalysis.biggestIssue || '') + (parsedAnalysis.improveFirst || ''))
-      
-      // Assign reasonable scores based on content quality
-      const baseScore = diagnosisLength > 200 && hasTechnicalTerms ? 7 : diagnosisLength > 100 ? 6 : 5
-      
-      scoreBreakdown.footwork = baseScore + Math.floor(Math.random() * 3) - 1
-      scoreBreakdown.positioning = baseScore + Math.floor(Math.random() * 3) - 1
-      scoreBreakdown.paddlePrep = baseScore + Math.floor(Math.random() * 3) - 1
-      scoreBreakdown.timing = baseScore + Math.floor(Math.random() * 3) - 1
-      scoreBreakdown.consistency = baseScore + Math.floor(Math.random() * 3) - 1
-
-      // Ensure scores are between 1-10
-      scoreBreakdown.footwork = Math.max(1, Math.min(10, scoreBreakdown.footwork as number))
-      scoreBreakdown.positioning = Math.max(1, Math.min(10, scoreBreakdown.positioning as number))
-      scoreBreakdown.paddlePrep = Math.max(1, Math.min(10, scoreBreakdown.paddlePrep as number))
-      scoreBreakdown.timing = Math.max(1, Math.min(10, scoreBreakdown.timing as number))
-      scoreBreakdown.consistency = Math.max(1, Math.min(10, scoreBreakdown.consistency as number))
-
-      console.log('Generated scores from analysis:', scoreBreakdown)
-      
-      const newValidScores = Object.values(scoreBreakdown).filter((v): v is number => typeof v === 'number' && v >= 1 && v <= 10)
-      overallScore = Math.round(newValidScores.reduce((a, b) => a + b, 0) / newValidScores.length)
-    } else {
-      // Fill in any remaining null scores with generated values
-      const baseScore = 6
-      if (scoreBreakdown.footwork === null) scoreBreakdown.footwork = baseScore + Math.floor(Math.random() * 3) - 1
-      if (scoreBreakdown.positioning === null) scoreBreakdown.positioning = baseScore + Math.floor(Math.random() * 3) - 1
-      if (scoreBreakdown.paddlePrep === null) scoreBreakdown.paddlePrep = baseScore + Math.floor(Math.random() * 3) - 1
-      if (scoreBreakdown.timing === null) scoreBreakdown.timing = baseScore + Math.floor(Math.random() * 3) - 1
-      if (scoreBreakdown.consistency === null) scoreBreakdown.consistency = baseScore + Math.floor(Math.random() * 3) - 1
-
-      // Ensure all scores are between 1-10
-      scoreBreakdown.footwork = Math.max(1, Math.min(10, scoreBreakdown.footwork as number))
-      scoreBreakdown.positioning = Math.max(1, Math.min(10, scoreBreakdown.positioning as number))
-      scoreBreakdown.paddlePrep = Math.max(1, Math.min(10, scoreBreakdown.paddlePrep as number))
-      scoreBreakdown.timing = Math.max(1, Math.min(10, scoreBreakdown.timing as number))
-      scoreBreakdown.consistency = Math.max(1, Math.min(10, scoreBreakdown.consistency as number))
-
-      console.log('Filled in missing scores:', scoreBreakdown)
-    }
-
-    // Final score verification - ensure no nulls exist
-    const finalScores = Object.values(scoreBreakdown).filter((v): v is number => typeof v === 'number' && v >= 1 && v <= 10)
-    if (finalScores.length !== 5) {
-      console.error('CRITICAL: Not all scores were populated!', scoreBreakdown)
-    }
-    overallScore = Math.round(finalScores.reduce((a, b) => a + b, 0) / finalScores.length)
-
-    const finalParsedAnalysis = {
-      targetPlayerIdentified: parsedAnalysis.targetPlayerIdentified,
-      diagnosis: parsedAnalysis.diagnosis,
-      readyPosition: parsedAnalysis.readyPosition,
-      contactPoint: parsedAnalysis.contactPoint,
-      recoveryStep: parsedAnalysis.recoveryStep,
-      biggestIssue: parsedAnalysis.biggestIssue,
-      improveFirst: parsedAnalysis.improveFirst,
-      drills: parsedAnalysis.drills,
-      score: overallScore,
-      scoreBreakdown,
-      scoreExplanation,
-    }
-
-    console.log('Final Analysis with scores:', finalParsedAnalysis)
-    return finalParsedAnalysis
-
   } catch (error) {
-    console.error('OpenAI Vision API error:', error)
-    throw new Error(`OpenAI API failed: ${error.message}`)
+    console.error('OpenAI Vision pipeline error:', error)
+    throw new Error(`OpenAI API failed: ${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
