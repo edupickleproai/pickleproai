@@ -1,0 +1,32 @@
+<svg width="760" height="160" viewBox="0 0 760 160" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="760" height="160" fill="transparent"/>
+
+  <g transform="translate(20 22)">
+    <path d="M113 58C113 90.0325 87.0325 116 55 116C49.2 116 43.6 115.15 38.31 113.57"
+          stroke="#57FF00" stroke-width="9" stroke-linecap="round"/>
+    <path d="M4 78C11.9 100.1 33.02 116 58 116"
+          stroke="#57FF00" stroke-width="9" stroke-linecap="round"/>
+    <path d="M15 22C25.56 8.58 42.2 0 61 0C89.72 0 113 23.28 113 52"
+          stroke="#57FF00" stroke-width="9" stroke-linecap="round"/>
+
+    <path d="M8 43H39C47 43 52 36 52 29C52 22 57 16 65 16H82"
+          stroke="#57FF00" stroke-width="9" stroke-linecap="round"/>
+    <path d="M1 63H61C69 63 75 57 75 49V44"
+          stroke="#57FF00" stroke-width="9" stroke-linecap="round"/>
+    <path d="M9 84H45C52 84 57 90 57 97V104"
+          stroke="#57FF00" stroke-width="9" stroke-linecap="round"/>
+
+    <circle cx="10" cy="29" r="6.5" fill="#57FF00"/>
+    <circle cx="75" cy="48" r="9" fill="#57FF00"/>
+    <circle cx="57" cy="98" r="8" fill="#57FF00"/>
+    <circle cx="99" cy="72" r="8" fill="#57FF00"/>
+  </g>
+
+  <text x="165" y="100"
+        font-family="Inter, Arial, sans-serif"
+        font-size="70"
+        font-weight="800"
+        fill="#FFFFFF">
+    PicklePro.<tspan fill="#57FF00">AI</tspan>
+  </text>
+</svg>
