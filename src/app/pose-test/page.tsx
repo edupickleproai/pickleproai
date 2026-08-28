@@ -20,6 +20,7 @@ interface PoseResult {
   }
   averageVisibility: number
   detectionConfidence: number
+  detectionSource?: string
 }
 
 interface PoseAnalysis {
@@ -87,6 +88,21 @@ function angleBetween3Points(a: Point2D, b: Point2D, c: Point2D) {
   return (Math.acos(cos) * 180) / Math.PI
 }
 
+function angleBetween3Points3D(a: any, b: any, c: any) {
+  const v1x = a.x - b.x
+  const v1y = a.y - b.y
+  const v1z = (a.z ?? 0) - (b.z ?? 0)
+  const v2x = c.x - b.x
+  const v2y = c.y - b.y
+  const v2z = (c.z ?? 0) - (b.z ?? 0)
+  const dot = v1x * v2x + v1y * v2y + v1z * v2z
+  const mag1 = Math.hypot(v1x, v1y, v1z)
+  const mag2 = Math.hypot(v2x, v2y, v2z)
+  if (mag1 === 0 || mag2 === 0) return NaN
+  const cos = clamp(dot / (mag1 * mag2), -1, 1)
+  return (Math.acos(cos) * 180) / Math.PI
+}
+
 const VISIBILITY_THRESHOLD = 0.3
 
 function confidenceLabel(conf: number) {
@@ -120,6 +136,16 @@ function calculateBiomechanics(pose: PoseResult, canvasWidth: number, canvasHeig
   const rightAnkle = getCanvas(RIGHT_ANKLE)
   const leftShoulder = getCanvas(LEFT_SHOULDER)
   const rightShoulder = getCanvas(RIGHT_SHOULDER)
+
+  // canvas-space copies for debug
+  const leftShoulderC = leftShoulder
+  const rightShoulderC = rightShoulder
+  const leftHipC = leftHip
+  const rightHipC = rightHip
+  const leftKneeC = leftKnee
+  const rightKneeC = rightKnee
+  const leftAnkleC = leftAnkle
+  const rightAnkleC = rightAnkle
 
   // Normalized coords (0..1) for debug
   const leftHipN = getNorm(LEFT_HIP)
@@ -179,6 +205,12 @@ function calculateBiomechanics(pose: PoseResult, canvasWidth: number, canvasHeig
   // This is a 2D camera-relative estimate (not true 3D trunk flexion).
   const shoulderMid = midpoint(leftShoulder, rightShoulder)
   const hipMid = midpoint(leftHip, rightHip)
+  const hipDistance2D = Math.hypot(leftHipN.x - rightHipN.x, leftHipN.y - rightHipN.y)
+  // Use aspect-corrected image distances for orientation geometry. Dividing all
+  // lengths by image height removes scale without distorting x relative to y.
+  const shoulderSpanGeometry = Math.hypot(leftShoulder.x - rightShoulder.x, leftShoulder.y - rightShoulder.y) / canvasHeight
+  const hipSpanGeometry = Math.hypot(leftHip.x - rightHip.x, leftHip.y - rightHip.y) / canvasHeight
+  const torsoLength2D = Math.hypot(shoulderMid.x - hipMid.x, shoulderMid.y - hipMid.y) / canvasHeight
   const torsoLineAngle = lineAngleDegrees(hipMid, shoulderMid) // degrees from +x axis
   // Angle relative to vertical (-90..90)
   const torsoLeanRaw = torsoLineAngle
@@ -222,6 +254,38 @@ function calculateBiomechanics(pose: PoseResult, canvasWidth: number, canvasHeig
   if (shoulderTilt > 90) shoulderTilt -= 180
   if (shoulderTilt < -90) shoulderTilt += 180
 
+  // Camera/body-orientation diagnostics. Span-to-torso ratios are scale-normalized
+  // proxies for foreshortening; shoulder/hip agreement catches unstable silhouettes.
+  // They cannot recover true 3D yaw, so thresholds remain conservative heuristics.
+  const shoulderSpanToTorso = torsoLength2D > 0 ? shoulderSpanGeometry / torsoLength2D : NaN
+  const hipSpanToTorso = torsoLength2D > 0 ? hipSpanGeometry / torsoLength2D : NaN
+  const shoulderToHipSpanRatio = hipSpanGeometry > 0 ? shoulderSpanGeometry / hipSpanGeometry : NaN
+  const hipLineAngle = lineAngleDegrees(leftHip, rightHip)
+  const normalizeAxisAngle = (angle: number) => {
+    let normalized = angle
+    while (normalized > 90) normalized -= 180
+    while (normalized < -90) normalized += 180
+    return normalized
+  }
+  const shoulderHipAxisDifference = Math.abs(normalizeAxisAngle(rawShoulderAngle - hipLineAngle))
+  const orientationReasons: string[] = []
+  if (!Number.isFinite(torsoLength2D) || torsoLength2D < 0.03) orientationReasons.push('Torso reference length is too small for stable normalization.')
+  if (!Number.isFinite(shoulderSpanToTorso) || shoulderSpanToTorso < 0.35) orientationReasons.push('Projected shoulder span is severely foreshortened.')
+  if (!Number.isFinite(hipSpanToTorso) || hipSpanToTorso < 0.2) orientationReasons.push('Projected hip span is severely foreshortened.')
+  if (!Number.isFinite(shoulderToHipSpanRatio) || shoulderToHipSpanRatio < 0.65 || shoulderToHipSpanRatio > 2.25) orientationReasons.push('Shoulder and hip spans are geometrically inconsistent.')
+  if (!Number.isFinite(shoulderHipAxisDifference) || shoulderHipAxisDifference > 35) orientationReasons.push('Shoulder and hip axes disagree strongly in the image.')
+  const orientationCautions: string[] = []
+  if (shoulderSpanToTorso < 0.5) orientationCautions.push('Possible shoulder foreshortening.')
+  if (hipSpanToTorso < 0.3) orientationCautions.push('Possible hip foreshortening.')
+  if (shoulderHipAxisDifference > 20) orientationCautions.push('Shoulder/hip axis alignment is marginal.')
+  const orientationReliability = torsoConf < 0.4 || orientationReasons.length > 0
+    ? 'Low'
+    : torsoConf < 0.7 || orientationCautions.length > 0
+      ? 'Medium'
+      : 'High'
+  const stanceDenominatorStable = Number.isFinite(shoulderSpanToTorso) && shoulderSpanToTorso >= 0.5 && shoulderDistance2D >= 0.025
+  const orientationSignature = { shoulderSpanToTorso, hipSpanToTorso, shoulderToHipSpanRatio, shoulderHipAxisDifference }
+
   return {
     // angles
     leftKneeAngle,
@@ -264,6 +328,24 @@ function calculateBiomechanics(pose: PoseResult, canvasWidth: number, canvasHeig
       leftAnkle: leftAnkleN,
       rightAnkle: rightAnkleN,
     },
+    // raw canvas-space points for easier debugging (pixels)
+    rawCanvas: {
+      leftShoulder: { x: leftShoulderC.x, y: leftShoulderC.y, visibility: leftShoulderN.visibility },
+      rightShoulder: { x: rightShoulderC.x, y: rightShoulderC.y, visibility: rightShoulderN.visibility },
+      leftHip: { x: leftHipC.x, y: leftHipC.y, visibility: leftHipN.visibility },
+      rightHip: { x: rightHipC.x, y: rightHipC.y, visibility: rightHipN.visibility },
+      leftKnee: { x: leftKneeC.x, y: leftKneeC.y, visibility: leftKneeN.visibility },
+      rightKnee: { x: rightKneeC.x, y: rightKneeC.y, visibility: rightKneeN.visibility },
+      leftAnkle: { x: leftAnkleC.x, y: leftAnkleC.y, visibility: leftAnkleN.visibility },
+      rightAnkle: { x: rightAnkleC.x, y: rightAnkleC.y, visibility: rightAnkleN.visibility },
+    },
+    orientationReliability,
+    orientationReasons,
+    orientationCautions,
+    orientationSignature,
+    stanceDenominatorStable,
+    hipDistNorm: hipDistance2D,
+    torsoLengthNorm: torsoLength2D,
   }
 }
 
@@ -278,6 +360,17 @@ export default function PoseTestPage() {
   const [analyses, setAnalyses] = useState<Record<Phase, PoseAnalysis | null>>({ ready: null, contact: null, recovery: null })
   const [selectedPoseIndex, setSelectedPoseIndex] = useState<Record<Phase, number | null>>({ ready: null, contact: null, recovery: null })
   const [error, setError] = useState<Record<Phase, string | null>>({ ready: null, contact: null, recovery: null })
+
+  // Video-to-frames state (Sprint 3.0)
+  const [videoFile, setVideoFile] = useState<File | null>(null)
+  const [videoUrl, setVideoUrl] = useState<string | null>(null)
+  const [videoMeta, setVideoMeta] = useState<{ duration: number; width: number; height: number } | null>(null)
+  const [frames, setFrames] = useState<Array<{ frameId: string; timestampSeconds: number; imageDataUrl: string }>>([])
+  const [extracting, setExtracting] = useState(false)
+  const [selectedPhaseToAssign, setSelectedPhaseToAssign] = useState<Phase>('ready')
+  const [selectedFrameByPhase, setSelectedFrameByPhase] = useState<Record<Phase, string | null>>({ ready: null, contact: null, recovery: null })
+  const [processingStatus, setProcessingStatus] = useState<string | null>(null)
+  const [lastFrameMeta, setLastFrameMeta] = useState<Record<Phase, { timestampSeconds: number; width: number; height: number } | null>>({ ready: null, contact: null, recovery: null })
 
   // Persistent targeting state
   const [persistentAnchor, setPersistentAnchor] = useState<null | { id: string; features: any }>(null)
@@ -317,6 +410,136 @@ export default function PoseTestPage() {
     } else {
       setPreviews((p) => ({ ...p, [phase]: null }))
     }
+  }
+
+  // Video handlers
+  const handleVideoChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0] ?? null
+    setVideoFile(file)
+    if (file) {
+      const url = URL.createObjectURL(file)
+      setVideoUrl(url)
+      setFrames([])
+      setVideoMeta(null)
+    } else {
+      setVideoUrl(null)
+      setFrames([])
+      setVideoMeta(null)
+    }
+  }
+
+  const extractCandidateFrames = async () => {
+    if (!videoUrl) return
+    setExtracting(true)
+    setProcessingStatus('Extracting candidate frames...')
+    try {
+      const video = document.createElement('video')
+      video.src = videoUrl
+      video.crossOrigin = 'anonymous'
+      await new Promise((res, rej) => {
+        const t = setTimeout(() => rej(new Error('Video load timeout')), 5000)
+        video.addEventListener('loadedmetadata', () => {
+          clearTimeout(t)
+          res(null)
+        })
+      })
+      const duration = video.duration || 0
+      const vidW = video.videoWidth || 640
+      const vidH = video.videoHeight || 360
+      setVideoMeta({ duration, width: vidW, height: vidH })
+
+      // sample target frames ~20-30 depending on duration
+      const target = Math.min(30, Math.max(8, Math.round(duration * 3)))
+      const sampleCount = Math.max(4, target)
+      const timestamps: number[] = []
+      for (let i = 0; i < sampleCount; i++) {
+        timestamps.push((i + 0.5) * (duration / sampleCount))
+      }
+
+      const off = document.createElement('canvas')
+      const ctx = off.getContext('2d')
+      // Preserve as much resolution as practical for detection. Cap width to 1280px.
+      const maxW = Math.min(1280, vidW)
+      const scale = Math.min(1, maxW / vidW)
+      off.width = Math.max(1, Math.round(vidW * scale))
+      off.height = Math.max(1, Math.round(vidH * scale))
+
+      const extracted: Array<{ frameId: string; timestampSeconds: number; imageDataUrl: string }> = []
+      for (let t of timestamps) {
+        await new Promise((res) => {
+          const onseek = () => {
+            try {
+              ctx && ctx.drawImage(video, 0, 0, off.width, off.height)
+              const data = off.toDataURL('image/jpeg', 0.92)
+              extracted.push({ frameId: `f-${Math.round(t * 1000)}`, timestampSeconds: t, imageDataUrl: data })
+            } catch (e) {
+              // skip
+            }
+            res(null)
+          }
+          video.currentTime = Math.min(Math.max(0.001, t), duration - 0.001)
+          video.addEventListener('seeked', onseek, { once: true })
+        })
+      }
+      setFrames(extracted)
+      setProcessingStatus('Frames ready')
+    } catch (err) {
+      console.error(err)
+      setProcessingStatus('Frame extraction failed')
+    } finally {
+      setExtracting(false)
+    }
+  }
+
+  const assignFrameToPhase = (phase: Phase, frameId: string) => {
+    setSelectedFrameByPhase((s) => ({ ...s, [phase]: frameId }))
+  }
+
+  // Analyze only Ready first so the developer can manually select TARGET_A.
+  const analyzeSelectedFrames = async () => {
+    setProcessingStatus('Analyzing Ready pose...')
+    const phase: Phase = 'ready'
+    const fid = selectedFrameByPhase[phase]
+    if (!fid) {
+      setProcessingStatus('Ready frame not assigned')
+      return
+    }
+    const frame = frames.find((f) => f.frameId === fid)
+    if (!frame) {
+      setProcessingStatus('Ready frame not found')
+      return
+    }
+    const img = new Image()
+    img.src = frame.imageDataUrl
+    await new Promise((res) => (img.onload = () => res(null)))
+    imageRefs.current[phase] = img
+    setCanvasSizes((s) => ({ ...s, [phase]: { width: img.naturalWidth, height: img.naturalHeight } }))
+    setLastFrameMeta((m) => ({ ...m, [phase]: { timestampSeconds: frame.timestampSeconds, width: img.naturalWidth, height: img.naturalHeight } }))
+    await handleDetectPose(phase)()
+    setProcessingStatus('Ready analyzed — please click the Ready canvas to select TARGET_A')
+  }
+
+  // After developer selects TARGET_A (manual), call this to analyze contact & recovery and auto-match
+  const analyzeRemainingAfterAnchor = async () => {
+    if (!persistentAnchor) {
+      setProcessingStatus('No anchor set. Select TARGET_A in Ready canvas first.')
+      return
+    }
+    setProcessingStatus('Analyzing Contact and Recovery...')
+    for (const phase of ['contact', 'recovery'] as Phase[]) {
+      const fid = selectedFrameByPhase[phase]
+      if (!fid) continue
+      const frame = frames.find((f) => f.frameId === fid)
+      if (!frame) continue
+      const img = new Image()
+      img.src = frame.imageDataUrl
+      await new Promise((res) => (img.onload = () => res(null)))
+      imageRefs.current[phase] = img
+      setCanvasSizes((s) => ({ ...s, [phase]: { width: img.naturalWidth, height: img.naturalHeight } }))
+      setLastFrameMeta((m) => ({ ...m, [phase]: { timestampSeconds: frame.timestampSeconds, width: img.naturalWidth, height: img.naturalHeight } }))
+      await handleDetectPose(phase)()
+    }
+    setProcessingStatus('Analyzing poses complete')
   }
 
   const drawImageFor = (canvas: HTMLCanvasElement | null, image: HTMLImageElement | null, size: { width: number; height: number } | null) => {
@@ -365,6 +588,123 @@ export default function PoseTestPage() {
 
     poseLandmarkerRef.current = landmarker
     return landmarker
+  }
+
+  // Run PoseLandmarker on an image (HTMLImageElement or HTMLCanvasElement)
+  // and return the raw result object with landmarks and worldLandmarks.
+  const runLandmarker = async (input: any) => {
+    const landmarker = await getPoseLandmarker()
+    const start = performance.now()
+    const result = landmarker.detect(input) as any
+    const duration = Math.round(performance.now() - start)
+    return { result, duration }
+  }
+
+  // IOU for bbox deduplication (boxes in pixels)
+  const iou = (a: any, b: any) => {
+    const x1 = Math.max(a.left, b.left)
+    const y1 = Math.max(a.top, b.top)
+    const x2 = Math.min(a.left + a.width, b.left + b.width)
+    const y2 = Math.min(a.top + a.height, b.top + b.height)
+    const w = Math.max(0, x2 - x1)
+    const h = Math.max(0, y2 - y1)
+    const inter = w * h
+    const union = a.width * a.height + b.width * b.height - inter
+    return union <= 0 ? 0 : inter / union
+  }
+
+  // Multi-pass detection: full frame, then optional left/right crops.
+  const detectMultiPass = async (image: HTMLImageElement, fullSize: { width: number; height: number }) => {
+    const posesOut: any[] = []
+
+    // PASS A: full frame
+    const full = await runLandmarker(image)
+    const fullRes = full.result
+    const fullWorld = fullRes.worldLandmarks ?? []
+    const fullLandmarks = fullRes.landmarks ?? []
+    if (fullLandmarks && fullLandmarks.length > 0) {
+      for (let i = 0; i < fullLandmarks.length; i++) {
+        const lms = fullLandmarks[i]
+        const world = fullWorld[i] ?? null
+        posesOut.push({ landmarks: lms, worldLandmarks: world, detectionSource: 'FULL_FRAME' })
+      }
+    }
+
+    // If less than 2 poses, run crop passes
+    if (posesOut.length < 2) {
+      const overlap = 0.15
+      const w = fullSize.width
+      const h = fullSize.height
+      const half = Math.floor(w / 2)
+      const leftX = 0
+      const leftW = Math.floor(half + overlap * half)
+      const rightX = Math.floor(half - overlap * half)
+      const rightW = Math.floor(w - rightX)
+
+      const runCrop = async (sx: number, sw: number, label: string) => {
+        const cvs = document.createElement('canvas')
+        cvs.width = sw
+        cvs.height = h
+        const ctx = cvs.getContext('2d')
+        if (!ctx) return
+        ctx.drawImage(image, sx, 0, sw, h, 0, 0, sw, h)
+        const img = new Image()
+        img.src = cvs.toDataURL('image/jpeg', 0.92)
+        await new Promise((res) => (img.onload = () => res(null)))
+        const resCrop = await runLandmarker(img)
+        const r = resCrop.result
+        const lm = r.landmarks ?? []
+        const wl = r.worldLandmarks ?? []
+        for (let i = 0; i < lm.length; i++) {
+          // map landmark x,y back to full-frame normalized coords
+          const lset = lm[i].map((pt: any) => ({ x: (pt.x * sw + sx) / w, y: (pt.y * h) / h, visibility: pt.visibility }))
+          const world = wl[i] ?? null
+          posesOut.push({ landmarks: lset, worldLandmarks: world, detectionSource: label })
+        }
+      }
+
+      await runCrop(leftX, leftW, 'LEFT_CROP')
+      await runCrop(rightX, rightW, 'RIGHT_CROP')
+    }
+
+    // Build PoseResult-like objects with bbox and confidence
+    const poseResults: PoseResult[] = []
+    for (let pi = 0; pi < posesOut.length; pi++) {
+      const plm = posesOut[pi].landmarks
+      const normXs = plm.map((lm: any) => lm.x)
+      const normYs = plm.map((lm: any) => lm.y)
+      const left = Math.min(...normXs) * fullSize.width
+      const top = Math.min(...normYs) * fullSize.height
+      const right = Math.max(...normXs) * fullSize.width
+      const bottom = Math.max(...normYs) * fullSize.height
+      const averageVisibility = calculateAverage(plm.map((l: any) => l.visibility ?? 0))
+      const detectionConfidence = averageVisibility
+      poseResults.push({
+        poseIndex: pi + 1,
+        landmarks: plm,
+        worldLandmarks: posesOut[pi].worldLandmarks ?? null,
+        bbox: { left: clamp(left, 0, fullSize.width), top: clamp(top, 0, fullSize.height), width: clamp(right - left, 0, fullSize.width), height: clamp(bottom - top, 0, fullSize.height) },
+        averageVisibility,
+        detectionConfidence,
+        detectionSource: posesOut[pi].detectionSource,
+      } as any)
+    }
+
+    // Deduplicate by IoU (keep higher-confidence)
+    poseResults.sort((a, b) => (b.detectionConfidence ?? 0) - (a.detectionConfidence ?? 0))
+    const deduped: PoseResult[] = []
+    for (const p of poseResults) {
+      let dup = false
+      for (const kept of deduped) {
+        if (iou(p.bbox, kept.bbox) > 0.5) {
+          dup = true
+          break
+        }
+      }
+      if (!dup) deduped.push(p)
+    }
+
+    return deduped
   }
 
   const calculateAverage = (values: number[]) => {
@@ -496,51 +836,145 @@ export default function PoseTestPage() {
       }
 
       drawImageFor(canvas, image, size)
-      const landmarker = await getPoseLandmarker()
       const startTime = performance.now()
-      const result = landmarker.detect(image) as any
-      const poses = result.landmarks ?? []
-      const world = result.worldLandmarks ?? []
+      const poseResults = await detectMultiPass(image, { width: image.naturalWidth, height: image.naturalHeight })
       const processingTimeMs = Math.round(performance.now() - startTime)
 
-      if (poses.length === 0) {
+      if (!poseResults || poseResults.length === 0) {
         setError((e) => ({ ...e, [phase]: 'No poses detected.' }))
         setAnalyses((a) => ({ ...a, [phase]: { poses: [], averageConfidence: 0, averageVisibility: 0, processingTimeMs } }))
         return
       }
 
-      const poseResults: PoseResult[] = poses.map((landmarks, index) => {
-        const normalizedXs = landmarks.map((landmark) => landmark.x)
-        const normalizedYs = landmarks.map((landmark) => landmark.y)
-        const left = Math.min(...normalizedXs) * size.width
-        const top = Math.min(...normalizedYs) * size.height
-        const right = Math.max(...normalizedXs) * size.width
-        const bottom = Math.max(...normalizedYs) * size.height
-        const averageVisibility = calculateAverage(landmarks.map((landmark) => landmark.visibility ?? 0))
-        const detectionConfidence = averageVisibility
-
-        return {
-          poseIndex: index + 1,
-          landmarks,
-          worldLandmarks: world[index] ?? null,
-          bbox: {
-            left: clamp(left, 0, size.width),
-            top: clamp(top, 0, size.height),
-            width: clamp(right - left, 0, size.width),
-            height: clamp(bottom - top, 0, size.height),
-          },
-          averageVisibility,
-          detectionConfidence,
-        }
-      })
-
       const averageVisibility = calculateAverage(poseResults.map((pose) => pose.averageVisibility))
       const averageConfidence = calculateAverage(poseResults.map((pose) => pose.detectionConfidence))
-      const analysisResult: PoseAnalysis = {
+
+      // Per-pose biomechanics diagnostics
+      const perPoseDiagnostics = poseResults.map((p) => {
+        const b = calculateBiomechanics(p, size.width, size.height)
+        // try to find a FULL_FRAME match to compare if this pose came from a crop
+        const fullMatch = poseResults.find((q) => q.detectionSource === 'FULL_FRAME' && iou(q.bbox, p.bbox) > 0.5)
+        let fullCompare = null
+        if (fullMatch && fullMatch !== p) {
+          const bf = calculateBiomechanics(fullMatch, size.width, size.height)
+          // image-space diffs
+          const imageDiffs = {
+            leftKneeAngleDiff: (b.leftKneeAngle ?? NaN) - (bf.leftKneeAngle ?? NaN),
+            rightKneeAngleDiff: (b.rightKneeAngle ?? NaN) - (bf.rightKneeAngle ?? NaN),
+            torsoLeanDiff: (b.torsoLean ?? NaN) - (bf.torsoLean ?? NaN),
+            shoulderTiltDiff: (b.shoulderTilt ?? NaN) - (bf.shoulderTilt ?? NaN),
+            stanceRatioDiff: (b.rawStanceRatio ?? NaN) - (bf.rawStanceRatio ?? NaN),
+          }
+
+          // world-space diffs (if worldLandmarks present on both)
+          let worldDiffs = null
+          try {
+            const LEFT_HIP = 23
+            const RIGHT_HIP = 24
+            const LEFT_KNEE = 25
+            const RIGHT_KNEE = 26
+            const LEFT_ANKLE = 27
+            const RIGHT_ANKLE = 28
+            const LEFT_SHOULDER = 11
+            const RIGHT_SHOULDER = 12
+
+            if (p.worldLandmarks && fullMatch.worldLandmarks) {
+              const wp = p.worldLandmarks
+              const wf = fullMatch.worldLandmarks
+
+              const lHipP = wp[LEFT_HIP]
+              const lKneeP = wp[LEFT_KNEE]
+              const lAnkP = wp[LEFT_ANKLE]
+              const rHipP = wp[RIGHT_HIP]
+              const rKneeP = wp[RIGHT_KNEE]
+              const rAnkP = wp[RIGHT_ANKLE]
+              const lShP = wp[LEFT_SHOULDER]
+              const rShP = wp[RIGHT_SHOULDER]
+
+              const lHipF = wf[LEFT_HIP]
+              const lKneeF = wf[LEFT_KNEE]
+              const lAnkF = wf[LEFT_ANKLE]
+              const rHipF = wf[RIGHT_HIP]
+              const rKneeF = wf[RIGHT_KNEE]
+              const rAnkF = wf[RIGHT_ANKLE]
+              const lShF = wf[LEFT_SHOULDER]
+              const rShF = wf[RIGHT_SHOULDER]
+
+              const leftKneeAngle3D_P = angleBetween3Points3D(lHipP, lKneeP, lAnkP)
+              const rightKneeAngle3D_P = angleBetween3Points3D(rHipP, rKneeP, rAnkP)
+              const leftKneeFlex3D_P = Number.isNaN(leftKneeAngle3D_P) ? NaN : 180 - leftKneeAngle3D_P
+              const rightKneeFlex3D_P = Number.isNaN(rightKneeAngle3D_P) ? NaN : 180 - rightKneeAngle3D_P
+
+              const leftKneeAngle3D_F = angleBetween3Points3D(lHipF, lKneeF, lAnkF)
+              const rightKneeAngle3D_F = angleBetween3Points3D(rHipF, rKneeF, rAnkF)
+              const leftKneeFlex3D_F = Number.isNaN(leftKneeAngle3D_F) ? NaN : 180 - leftKneeAngle3D_F
+              const rightKneeFlex3D_F = Number.isNaN(rightKneeAngle3D_F) ? NaN : 180 - rightKneeAngle3D_F
+
+              // world distances
+              let worldAnkleDistP = NaN
+              let worldShoulderDistP = NaN
+              let worldAnkleDistF = NaN
+              let worldShoulderDistF = NaN
+              if (lAnkP && rAnkP) worldAnkleDistP = Math.hypot(lAnkP.x - rAnkP.x, lAnkP.y - rAnkP.y, (lAnkP.z ?? 0) - (rAnkP.z ?? 0))
+              if (lShP && rShP) worldShoulderDistP = Math.hypot(lShP.x - rShP.x, lShP.y - rShP.y, (lShP.z ?? 0) - (rShP.z ?? 0))
+              if (lAnkF && rAnkF) worldAnkleDistF = Math.hypot(lAnkF.x - rAnkF.x, lAnkF.y - rAnkF.y, (lAnkF.z ?? 0) - (rAnkF.z ?? 0))
+              if (lShF && rShF) worldShoulderDistF = Math.hypot(lShF.x - rShF.x, lShF.y - rShF.y, (lShF.z ?? 0) - (rShF.z ?? 0))
+
+              // torso vectors
+              const sMidP = { x: (lShP.x + rShP.x) / 2, y: (lShP.y + rShP.y) / 2, z: ((lShP.z ?? 0) + (rShP.z ?? 0)) / 2 }
+              const hMidP = { x: (lHipP.x + rHipP.x) / 2, y: (lHipP.y + rHipP.y) / 2, z: ((lHipP.z ?? 0) + (rHipP.z ?? 0)) / 2 }
+              const vP = { x: sMidP.x - hMidP.x, y: sMidP.y - hMidP.y, z: sMidP.z - hMidP.z }
+              const sMidF = { x: (lShF.x + rShF.x) / 2, y: (lShF.y + rShF.y) / 2, z: ((lShF.z ?? 0) + (rShF.z ?? 0)) / 2 }
+              const hMidF = { x: (lHipF.x + rHipF.x) / 2, y: (lHipF.y + rHipF.y) / 2, z: ((lHipF.z ?? 0) + (rHipF.z ?? 0)) / 2 }
+              const vF = { x: sMidF.x - hMidF.x, y: sMidF.y - hMidF.y, z: sMidF.z - hMidF.z }
+
+              const dotVF = vP.x * vF.x + vP.y * vF.y + vP.z * vF.z
+              const magVP = Math.hypot(vP.x, vP.y, vP.z)
+              const magVF = Math.hypot(vF.x, vF.y, vF.z)
+              const torsoVectorAngle = (magVP === 0 || magVF === 0) ? NaN : (Math.acos(clamp(dotVF / (magVP * magVF), -1, 1)) * 180) / Math.PI
+
+              worldDiffs = {
+                leftKneeAngle3D_P,
+                rightKneeAngle3D_P,
+                leftKneeFlex3D_P,
+                rightKneeFlex3D_P,
+                leftKneeAngle3D_F,
+                rightKneeAngle3D_F,
+                leftKneeFlex3D_F,
+                rightKneeFlex3D_F,
+                worldAnkleDistP,
+                worldShoulderDistP,
+                worldAnkleDistF,
+                worldShoulderDistF,
+                worldAnkleScale: worldAnkleDistP && worldAnkleDistF ? worldAnkleDistP / worldAnkleDistF : NaN,
+                worldShoulderScale: worldShoulderDistP && worldShoulderDistF ? worldShoulderDistP / worldShoulderDistF : NaN,
+                torsoVectorAngleBetween: torsoVectorAngle,
+              }
+            }
+          } catch (e) {
+            // ignore
+          }
+
+          fullCompare = { imageDiffs, worldDiffs }
+        }
+        return { poseIndex: p.poseIndex, detectionSource: p.detectionSource, bbox: p.bbox, averageVisibility: p.averageVisibility, biomechanics: b, compareToFullFrame: fullCompare }
+      })
+
+      const analysisResult: any = {
         poses: poseResults,
         averageConfidence,
         averageVisibility,
         processingTimeMs,
+        detectionInfo: {
+          numPoses: 4,
+          minPoseDetectionConfidence: 0.3,
+          minPosePresenceConfidence: 0.2,
+          minTrackingConfidence: 0.2,
+          inputWidth: image.naturalWidth,
+          inputHeight: image.naturalHeight,
+          inputIsThumbnail: false,
+        },
+        perPoseDiagnostics,
       }
 
       setAnalyses((a) => ({ ...a, [phase]: analysisResult }))
@@ -651,43 +1085,53 @@ export default function PoseTestPage() {
     const canonical: any = {}
 
     // Stance: prefer worldStanceRatio if available and positive
-    if (!Number.isNaN(bio.worldStanceRatio) && Number.isFinite(bio.worldStanceRatio) && bio.worldStanceRatio > 0) {
-      canonical.stance = {
-        value: bio.worldStanceRatio,
-        unit: 'x',
-        source: 'world',
-        reliability: bio.stanceConf >= 0.5 ? 'High' : bio.stanceConf >= 0.3 ? 'Medium' : 'Low',
-        rawValue: bio.worldStanceRatio,
-        diagnostics: { worldAnkleDistance: bio.worldAnkleDistance, worldShoulderDistance: bio.worldShoulderDistance },
-      }
-    } else if (!Number.isNaN(bio.rawStanceRatio) && Number.isFinite(bio.rawStanceRatio) && bio.rawStanceRatio > 0) {
+    // Stance: prefer world for diagnostics but IMAGE for coaching eligibility due to orientation sensitivity
+    if (!Number.isNaN(bio.rawStanceRatio) && Number.isFinite(bio.rawStanceRatio) && bio.rawStanceRatio > 0) {
+      const reliability = bio.orientationReliability === 'Low' ? 'Low' : bio.stanceConf >= 0.6 ? 'High' : bio.stanceConf >= 0.4 ? 'Medium' : 'Low'
+      const coachingEligible = reliability === 'High' && bio.orientationReliability === 'High' && bio.stanceDenominatorStable
+      const reason = coachingEligible ? '' : [
+        'Camera/body orientation or stance-width normalization is unreliable.',
+        ...(bio.orientationReasons ?? []),
+        ...(bio.orientationCautions ?? []),
+        !bio.stanceDenominatorStable ? 'Projected shoulder span is an unstable stance-width denominator.' : '',
+      ].filter(Boolean).join(' ')
       canonical.stance = {
         value: bio.rawStanceRatio,
         unit: 'x',
         source: 'image',
-        reliability: bio.orientationReliability === 'Low' ? 'Low' : bio.stanceConf >= 0.6 ? 'High' : bio.stanceConf >= 0.4 ? 'Medium' : 'Low',
+        reliability,
+        coachingEligible,
+        reason,
         rawValue: bio.rawStanceRatio,
-        diagnostics: { ankleDistance2D: bio.ankleDistNorm, shoulderDistance2D: bio.shoulderDistNorm, orientationReliability: bio.orientationReliability },
+        diagnostics: { ankleDistance2D: bio.ankleDistNorm, shoulderDistance2D: bio.shoulderDistNorm, orientationReliability: bio.orientationReliability, orientationSignature: bio.orientationSignature, stanceDenominatorStable: bio.stanceDenominatorStable, worldStanceRatio: bio.worldStanceRatio, worldAnkleDistance: bio.worldAnkleDistance, worldShoulderDistance: bio.worldShoulderDistance },
       }
     } else {
-      canonical.stance = { value: NaN, unit: 'x', source: 'fallback', reliability: 'Low', rawValue: NaN, diagnostics: {} }
+      canonical.stance = { value: NaN, unit: 'x', source: 'fallback', reliability: 'Low', coachingEligible: false, reason: 'No valid stance measurements', rawValue: NaN, diagnostics: {} }
     }
 
     // Knee flexion: compute both image and world candidate
     const makeKnee = (side: 'left' | 'right') => {
       const joint = side === 'left' ? (bio.leftKneeAngle ?? NaN) : (bio.rightKneeAngle ?? NaN)
       const flex = side === 'left' ? (bio.leftKneeFlexion ?? NaN) : (bio.rightKneeFlexion ?? NaN)
-      const worldFlex = NaN
-      // world flexion: if worldLandmarks exist, will be computed by calculateBiomechanics as extra fields? We compute here if possible
-      // In our calculateBiomechanics we didn't attach per-knee world angles; attempt to compute from pose.worldLandmarks if present via bio.rawWorld? bio does not include worldLandmarks here, so skip.
+      const conf = side === 'left' ? bio.leftKneeConf : bio.rightKneeConf
+      const reliability = conf >= 0.7 ? 'High' : conf >= 0.4 ? 'Medium' : 'Low'
+      const geometryEligible = bio.orientationReliability !== 'Low'
+      const coachingEligible = (reliability === 'High' || reliability === 'Medium') && geometryEligible
+      const reason = coachingEligible ? '' : [
+        reliability === 'Low' ? 'Insufficient landmark visibility for reliable knee flexion.' : '',
+        !geometryEligible ? 'Severe body rotation/foreshortening makes image-space knee flexion unreliable.' : '',
+        ...(bio.orientationReasons ?? []),
+      ].filter(Boolean).join(' ')
       return {
         value: flex,
         unit: '°',
         source: 'image',
-        reliability: (side === 'left' ? bio.leftKneeConf : bio.rightKneeConf) >= 0.7 ? 'High' : (side === 'left' ? bio.leftKneeConf : bio.rightKneeConf) >= 0.4 ? 'Medium' : 'Low',
+        reliability,
+        coachingEligible: coachingEligible && !Number.isNaN(flex),
+        reason: coachingEligible && !Number.isNaN(flex) ? '' : reason,
         rawValue: flex,
-        diagnostics: { jointAngle: joint },
-        worldCandidate: { value: worldFlex, available: false },
+        diagnostics: { jointAngle: joint, orientationReliability: bio.orientationReliability, orientationSignature: bio.orientationSignature },
+        worldCandidate: { value: NaN, available: false, coachingEligible: false, reason: 'World knee flexion experimental; use full-frame world detections only.' },
       }
     }
 
@@ -695,35 +1139,49 @@ export default function PoseTestPage() {
     canonical.kneeRight = makeKnee('right')
 
     // Torso: prefer worldTorsoLean when available
-    if (!Number.isNaN(bio.worldTorsoLean) && Number.isFinite(bio.worldTorsoLean)) {
-      canonical.torso = {
-        value: bio.worldTorsoLean,
-        unit: '°',
-        source: 'world',
-        reliability: bio.torsoConf >= 0.5 ? 'High' : bio.torsoConf >= 0.3 ? 'Medium' : 'Low',
-        rawValue: bio.worldTorsoLean,
-        diagnostics: { worldTorsoRaw: bio.worldTorsoLean, imageTorso: bio.torsoLean },
-      }
-    } else {
+    // Torso: prefer IMAGE-space normalized torso lean for coaching eligibility
+    {
+      const reliability = bio.torsoConf >= 0.7 ? 'High' : bio.torsoConf >= 0.4 ? 'Medium' : 'Low'
+      const coachingEligible = reliability === 'High' && bio.orientationReliability !== 'Low'
+      const reason = coachingEligible ? '' : [
+        reliability !== 'High' ? 'Insufficient shoulder/hip visibility for reliable torso lean.' : '',
+        bio.orientationReliability === 'Low' ? 'Severe body rotation/foreshortening makes image-space torso lean unreliable.' : '',
+        ...(bio.orientationReasons ?? []),
+      ].filter(Boolean).join(' ')
       canonical.torso = {
         value: bio.torsoLean,
         unit: '°',
         source: 'image',
-        reliability: bio.torsoConf >= 0.7 ? 'High' : bio.torsoConf >= 0.4 ? 'Medium' : 'Low',
+        reliability,
+        coachingEligible,
+        reason,
         rawValue: bio.torsoLean,
-        diagnostics: { imageTorsoRaw: bio.torsoLean },
+        diagnostics: { imageTorsoRaw: bio.torsoLean, orientationSignature: bio.orientationSignature, worldTorsoLeanRaw: bio.worldTorsoLeanRaw, worldTorsoLean: bio.worldTorsoLean },
       }
     }
 
     // Shoulders: keep image tilt as canonical for now, provide world candidate if present
-    canonical.shoulder = {
-      value: bio.shoulderTilt,
-      unit: '°',
-      source: 'image',
-      reliability: bio.shoulderTiltConf >= 0.7 ? 'High' : bio.shoulderTiltConf >= 0.4 ? 'Medium' : 'Low',
-      rawValue: bio.rawShoulderAngle,
-      diagnostics: { imageRaw: bio.rawShoulderAngle },
-      worldCandidate: { available: !Number.isNaN(bio.worldShoulderDistance), value: bio.worldShoulderDistance ?? NaN },
+    // For coaching: use absolute magnitude; signed tilt preserved in diagnostics
+    {
+      const rel = bio.shoulderTiltConf >= 0.7 ? 'High' : bio.shoulderTiltConf >= 0.4 ? 'Medium' : 'Low'
+      const magnitude = Math.abs(bio.shoulderTilt)
+      const coachingEligible = rel === 'High' && bio.orientationReliability === 'High'
+      const reason = coachingEligible ? '' : [
+        'Shoulder tilt magnitude is unreliable due to orientation or low visibility.',
+        ...(bio.orientationReasons ?? []),
+        ...(bio.orientationCautions ?? []),
+      ].filter(Boolean).join(' ')
+      canonical.shoulder = {
+        value: magnitude,
+        unit: '°',
+        source: 'image',
+        reliability: rel,
+        coachingEligible,
+        reason,
+        rawValue: bio.rawShoulderAngle,
+        diagnostics: { imageRaw: bio.rawShoulderAngle, signedTilt: bio.shoulderTilt, orientationSignature: bio.orientationSignature },
+        worldCandidate: { available: !Number.isNaN(bio.worldShoulderDistance), value: bio.worldShoulderDistance ?? NaN, coachingEligible: false, reason: 'World shoulder metrics experimental.' },
+      }
     }
 
     return canonical
@@ -733,22 +1191,14 @@ export default function PoseTestPage() {
   const canC = buildCanonical(bioC)
   const canX = buildCanonical(bioX)
 
-  const avgKnee = (b: any) => {
-    if (!b) return NaN
-    const vals: number[] = []
-    if (!isNaN(b.leftKneeAngle)) vals.push(b.leftKneeAngle)
-    if (!isNaN(b.rightKneeAngle)) vals.push(b.rightKneeAngle)
-    if (vals.length === 0) return NaN
-    return vals.reduce((s, v) => s + v, 0) / vals.length
-  }
-
-  const delta = (a: number, b: number) => (isNaN(a) || isNaN(b) ? NaN : b - a)
-
+  // Preserve eligibility and source metadata so the comparison layer cannot
+  // accidentally turn an experimental or unreliable metric into coaching output.
   const metrics = [
-    { key: 'Knee (avg)', a: canR ? ((canR.kneeLeft.value + canR.kneeRight.value) / 2) : NaN, b: canC ? ((canC.kneeLeft.value + canC.kneeRight.value) / 2) : NaN, c: canX ? ((canX.kneeLeft.value + canX.kneeRight.value) / 2) : NaN, unit: '°' },
-    { key: 'Torso Lean', a: canR?.torso.value ?? NaN, b: canC?.torso.value ?? NaN, c: canX?.torso.value ?? NaN, unit: '°' },
-    { key: 'Stance Width', a: canR?.stance.value ?? NaN, b: canC?.stance.value ?? NaN, c: canX?.stance.value ?? NaN, unit: 'x' },
-    { key: 'Shoulder Tilt', a: canR?.shoulder.value ?? NaN, b: canC?.shoulder.value ?? NaN, c: canX?.shoulder.value ?? NaN, unit: '°' },
+    { key: 'Left Knee Flexion', kind: 'knee', ready: canR?.kneeLeft ?? null, contact: canC?.kneeLeft ?? null, recovery: canX?.kneeLeft ?? null },
+    { key: 'Right Knee Flexion', kind: 'knee', ready: canR?.kneeRight ?? null, contact: canC?.kneeRight ?? null, recovery: canX?.kneeRight ?? null },
+    { key: 'Torso Lean', kind: 'orientationSensitive', ready: canR?.torso ?? null, contact: canC?.torso ?? null, recovery: canX?.torso ?? null },
+    { key: 'Stance Width', kind: 'orientationSensitive', ready: canR?.stance ?? null, contact: canC?.stance ?? null, recovery: canX?.stance ?? null },
+    { key: 'Shoulder Tilt', kind: 'orientationSensitive', ready: canR?.shoulder ?? null, contact: canC?.shoulder ?? null, recovery: canX?.shoulder ?? null },
   ];
 
   const content = (
@@ -758,6 +1208,68 @@ export default function PoseTestPage() {
           <div className="mb-8 flex flex-col gap-4 rounded-3xl border border-slate-800 bg-slate-950/80 p-6 text-slate-100 shadow-sm shadow-slate-950/20 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex items-center justify-between">
               <div className="text-lg font-semibold">Pose Test — Upload images for Ready / Contact / Recovery</div>
+            </div>
+            {/* Video upload and frame timeline card (styled to match existing UI) */}
+            <div className="mt-6">
+              <div className="rounded-3xl border border-slate-800 bg-slate-950/70 p-6">
+                <div className="mb-2 text-sm text-slate-300">Upload a single video to extract candidate frames (browser-only)</div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div>
+                    {videoUrl ? <video src={videoUrl} controls className="w-full rounded-2xl bg-black" /> : <div className="h-36 rounded-2xl bg-slate-900/40 flex items-center justify-center text-sm text-slate-400">No video loaded</div>}
+                  </div>
+                  <div className="space-y-2">
+                    <div className="text-sm text-slate-300">{videoMeta ? `Duration: ${videoMeta.duration.toFixed(2)}s • ${videoMeta.width}x${videoMeta.height}` : (videoFile ? videoFile.name : 'Video file not selected')}</div>
+                    <div className="flex gap-2">
+                      <label className="inline-flex items-center justify-center rounded-2xl bg-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 cursor-pointer">
+                        <input type="file" accept="video/*" onChange={handleVideoChange} className="hidden" />
+                        Choose Video
+                      </label>
+                      <button type="button" onClick={extractCandidateFrames} disabled={extracting || !videoUrl} className="inline-flex items-center justify-center rounded-2xl border border-emerald-500 px-4 py-2 text-sm font-semibold text-emerald-300">
+                        {extracting ? 'Extracting...' : 'Extract Frames'}
+                      </button>
+                      <button type="button" onClick={() => { setFrames([]); setVideoUrl(null); setVideoFile(null); }} className="inline-flex items-center justify-center rounded-2xl border border-rose-500 px-4 py-2 text-sm text-rose-300">
+                        Clear Video
+                      </button>
+                    </div>
+                    <div className="text-xs text-slate-400">Status: {processingStatus ?? 'Idle'}</div>
+                  </div>
+                </div>
+
+                {frames && frames.length > 0 ? (
+                  <div className="mt-4">
+                    <div className="mb-2 text-sm text-slate-300">Candidate frames ({frames.length}) — select a phase then click a thumbnail to assign</div>
+                    <div className="flex gap-3 items-center mb-3">
+                      <button onClick={() => setSelectedPhaseToAssign('ready')} className={`px-3 py-1 rounded ${selectedPhaseToAssign === 'ready' ? 'bg-emerald-600 text-white' : 'bg-slate-800 text-slate-300'}`}>Assign Ready</button>
+                      <button onClick={() => setSelectedPhaseToAssign('contact')} className={`px-3 py-1 rounded ${selectedPhaseToAssign === 'contact' ? 'bg-emerald-600 text-white' : 'bg-slate-800 text-slate-300'}`}>Assign Contact</button>
+                      <button onClick={() => setSelectedPhaseToAssign('recovery')} className={`px-3 py-1 rounded ${selectedPhaseToAssign === 'recovery' ? 'bg-emerald-600 text-white' : 'bg-slate-800 text-slate-300'}`}>Assign Recovery</button>
+                      <div className="ml-4 text-sm text-slate-300">Selected phase: <strong>{selectedPhaseToAssign.toUpperCase()}</strong></div>
+                    </div>
+                    <div className="grid grid-cols-6 gap-2">
+                      {frames.map((f) => (
+                        <div key={f.frameId} className="cursor-pointer" onClick={() => assignFrameToPhase(selectedPhaseToAssign, f.frameId)}>
+                          <img src={f.imageDataUrl} alt={`frame-${f.frameId}`} className="w-full rounded" />
+                          <div className="text-xs text-slate-400 text-center">{f.timestampSeconds.toFixed(2)}s</div>
+                        </div>
+                      ))}
+                    </div>
+
+                    <div className="mt-4 text-sm text-slate-200">
+                      <div>Ready Position: {selectedFrameByPhase.ready ? `${(frames.find(f=>f.frameId===selectedFrameByPhase.ready)?.timestampSeconds ?? 0).toFixed(2)}s` : '—'}</div>
+                      <div>Contact Point: {selectedFrameByPhase.contact ? `${(frames.find(f=>f.frameId===selectedFrameByPhase.contact)?.timestampSeconds ?? 0).toFixed(2)}s` : '—'}</div>
+                      <div>Recovery Step: {selectedFrameByPhase.recovery ? `${(frames.find(f=>f.frameId===selectedFrameByPhase.recovery)?.timestampSeconds ?? 0).toFixed(2)}s` : '—'}</div>
+                    </div>
+
+                    <div className="mt-4 flex items-center gap-3">
+                      <button type="button" onClick={analyzeSelectedFrames} disabled={!selectedFrameByPhase.ready} className="inline-flex items-center justify-center rounded-2xl bg-emerald-500 px-6 py-3 text-base font-semibold text-slate-950">
+                        Analyze Ready Frame
+                      </button>
+                      <button type="button" onClick={analyzeRemainingAfterAnchor} disabled={!selectedFrameByPhase.contact || !selectedFrameByPhase.recovery} className="inline-flex items-center justify-center rounded-2xl border border-emerald-500 px-6 py-3 text-base font-semibold text-emerald-300">
+                        Analyze Contact & Recovery (after TARGET_A)
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
             </div>
           </div>
 
@@ -853,6 +1365,12 @@ export default function PoseTestPage() {
                     return (
                       <div key={phase} className="space-y-2">
                         <div className="text-sm font-semibold text-slate-100">{phase === 'ready' ? 'Ready Position' : phase === 'contact' ? 'Contact Point' : 'Recovery Step'}</div>
+                        {lastFrameMeta[phase] ? (
+                          <div className="text-xs text-slate-400">Source: {lastFrameMeta[phase]!.timestampSeconds.toFixed(2)}s • Frame: {lastFrameMeta[phase]!.width}×{lastFrameMeta[phase]!.height}</div>
+                        ) : null}
+                        {a && (a as any).detectionInfo ? (
+                          <div className="text-xs text-slate-400">MediaPipe input: {(a as any).detectionInfo.inputWidth}×{(a as any).detectionInfo.inputHeight} • numPoses: {(a as any).detectionInfo.numPoses} • minPoseDetectionConfidence: {(a as any).detectionInfo.minPoseDetectionConfidence}</div>
+                        ) : null}
                         {a && a.poses.length > 0 ? (
                           a.poses.map((pose) => (
                             <div key={`${phase}-${pose.poseIndex}`} className="rounded-3xl border border-slate-800 bg-slate-900/70 p-4">
@@ -863,7 +1381,7 @@ export default function PoseTestPage() {
                                     <span className="inline-flex items-center rounded-full bg-emerald-500/15 px-2 py-1 text-xs font-semibold text-emerald-300 ring-1 ring-emerald-500/30">TARGET</span>
                                   ) : null}
                                 </div>
-                                <span>{pose.landmarks.length} landmarks</span>
+                                <span>{pose.landmarks.length} landmarks • {pose.detectionSource ?? 'FULL_FRAME'}</span>
                               </div>
                               <div className="mt-4 grid gap-2 text-sm text-slate-300 sm:grid-cols-2">
                                 <div>
@@ -876,7 +1394,7 @@ export default function PoseTestPage() {
                                 <div>
                                   <p className="font-medium text-slate-100">Metrics</p>
                                   <p>Avg visibility: {pose.averageVisibility.toFixed(2)}</p>
-                                  <p>Detection confidence: {pose.detectionConfidence.toFixed(2)}</p>
+                                  <p>Detection confidence: {pose.detectionConfidence.toFixed(2)} • Source: {pose.detectionSource ?? 'FULL_FRAME'}</p>
                                     {matchCandidates[phase] && matchCandidates[phase].length > 0 ? (
                                       (() => {
                                         const cand = matchCandidates[phase].find((c: any) => c.poseIndex === pose.poseIndex)
@@ -896,6 +1414,9 @@ export default function PoseTestPage() {
                         ) : (
                           <div className="text-sm text-slate-400">No pose results for this phase.</div>
                         )}
+                          {a && a.poses.length < 2 && frames.length > 1 ? (
+                            <div className="mt-2 text-xs text-rose-400">Possible missed player detection.</div>
+                          ) : null}
                       </div>
                     )
                   })}
@@ -909,7 +1430,6 @@ export default function PoseTestPage() {
                 canvasSizes={canvasSizes}
                 metrics={metrics}
                 canonicalMetrics={{ ready: canR, contact: canC, recovery: canX }}
-                delta={delta}
                 calculateBiomechanics={calculateBiomechanics}
               />
             </div>
