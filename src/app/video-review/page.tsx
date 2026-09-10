@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { Send, Upload, Video } from 'lucide-react'
+import { appendVideoBiomechanics } from '@/lib/coaching-biomechanics'
 
 // Clean markdown artifacts from text
 function cleanMarkdown(text: string): string {
@@ -278,14 +279,14 @@ export default function VideoReviewPage() {
   }
 
   useEffect(() => {
-    const saved = window.localStorage.getItem('picklepro:user')
-    if (saved) {
-      try {
+    try {
+      const saved = window.localStorage.getItem('picklepro:user')
+      if (saved) {
         const parsed = JSON.parse(saved) as UserProfile
         setProfile((prev) => ({ ...prev, ...parsed }))
-      } catch {
-        // ignore invalid data
       }
+    } catch {
+      // Storage may be unavailable or contain invalid JSON; keep defaults.
     }
   }, [])
 
@@ -356,6 +357,12 @@ export default function VideoReviewPage() {
       formData.append('targetPlayerSelection', targetPlayerSelection)
       formData.append('targetPlayerDescription', buildTargetPlayerDescription())
       formData.append('userProfile', JSON.stringify(profile))
+      const sentCoachingBiomechanics = videoFile
+        ? appendVideoBiomechanics(formData, videoFile, () => window.localStorage)
+        : null
+      if (process.env.NODE_ENV !== 'production') {
+        console.info('[dev] /api/video-analysis sanitized coaching biomechanics payload:', JSON.stringify(sentCoachingBiomechanics))
+      }
 
       console.log("Sending video for analysis...")
       const response = await fetch('/api/video-analysis', {

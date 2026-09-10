@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, type ChangeEvent } from 'react'
 import BiomechanicsPanel from './BiomechanicsPanel'
 import type { NormalizedLandmark } from '@mediapipe/tasks-vision'
+import { buildCoachingBiomechanicsPayload, clearStoredVideoBiomechanics, COACHING_BIOMECHANICS_STORAGE_KEY, videoFingerprint } from '@/lib/coaching-biomechanics'
 
 const MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task'
@@ -380,6 +381,29 @@ export default function PoseTestPage() {
   const imageRefs = useRef<Record<Phase, HTMLImageElement | null>>({} as any)
   const canvasRefs = useRef<Record<Phase, HTMLCanvasElement | null>>({} as any)
   const poseLandmarkerRef = useRef<any>(null)
+  const sourceGeneration = useRef(0)
+  const [phaseVideoFingerprint, setPhaseVideoFingerprint] = useState<Record<Phase, string | null>>({ ready: null, contact: null, recovery: null })
+
+  const resetVideoAnalysis = () => {
+    clearStoredVideoBiomechanics(() => window.localStorage, videoFile ? videoFingerprint(videoFile) : null)
+    sourceGeneration.current += 1
+    setAnalyses({ ready: null, contact: null, recovery: null })
+    setSelectedPoseIndex({ ready: null, contact: null, recovery: null })
+    setSelectedFrameByPhase({ ready: null, contact: null, recovery: null })
+    setPhaseVideoFingerprint({ ready: null, contact: null, recovery: null })
+    setLastFrameMeta({ ready: null, contact: null, recovery: null })
+    setPersistentAnchor(null)
+    setPersistentAssignment({ ready: {}, contact: {}, recovery: {} })
+    setMatchCandidates({ ready: [], contact: [], recovery: [] })
+    setLoading({ ready: false, contact: false, recovery: false })
+    setError({ ready: null, contact: null, recovery: null })
+    setExtracting(false)
+    setFiles({ ready: null, contact: null, recovery: null })
+    setPreviews({ ready: null, contact: null, recovery: null })
+    imageRefs.current = { ready: null, contact: null, recovery: null }
+    Object.values(canvasRefs.current).forEach((canvas) => canvas?.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height))
+    setProcessingStatus(null)
+  }
 
   useEffect(() => {
     // revoke previews when files change or component unmounts
@@ -399,6 +423,9 @@ export default function PoseTestPage() {
   }, [])
 
   const handleFileChange = (phase: Phase) => (event: ChangeEvent<HTMLInputElement>) => {
+    sourceGeneration.current += 1
+    setPhaseVideoFingerprint((s) => ({ ...s, [phase]: null }))
+    setAnalyses((a) => ({ ...a, [phase]: null }))
     const file = event.target.files?.[0] ?? null
     setFiles((s) => ({ ...s, [phase]: file }))
     if (file) {
@@ -415,6 +442,7 @@ export default function PoseTestPage() {
   // Video handlers
   const handleVideoChange = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0] ?? null
+    resetVideoAnalysis()
     setVideoFile(file)
     if (file) {
       const url = URL.createObjectURL(file)
@@ -430,6 +458,7 @@ export default function PoseTestPage() {
 
   const extractCandidateFrames = async () => {
     if (!videoUrl) return
+    const generation = sourceGeneration.current
     setExtracting(true)
     setProcessingStatus('Extracting candidate frames...')
     try {
@@ -446,6 +475,7 @@ export default function PoseTestPage() {
       const duration = video.duration || 0
       const vidW = video.videoWidth || 640
       const vidH = video.videoHeight || 360
+      if (generation !== sourceGeneration.current) return
       setVideoMeta({ duration, width: vidW, height: vidH })
 
       // sample target frames ~20-30 depending on duration
@@ -481,13 +511,15 @@ export default function PoseTestPage() {
           video.addEventListener('seeked', onseek, { once: true })
         })
       }
+      if (generation !== sourceGeneration.current) return
       setFrames(extracted)
       setProcessingStatus('Frames ready')
     } catch (err) {
+      if (generation !== sourceGeneration.current) return
       console.error(err)
       setProcessingStatus('Frame extraction failed')
     } finally {
-      setExtracting(false)
+      if (generation === sourceGeneration.current) setExtracting(false)
     }
   }
 
@@ -497,6 +529,7 @@ export default function PoseTestPage() {
 
   // Analyze only Ready first so the developer can manually select TARGET_A.
   const analyzeSelectedFrames = async () => {
+    const generation = sourceGeneration.current
     setProcessingStatus('Analyzing Ready pose...')
     const phase: Phase = 'ready'
     const fid = selectedFrameByPhase[phase]
@@ -512,6 +545,8 @@ export default function PoseTestPage() {
     const img = new Image()
     img.src = frame.imageDataUrl
     await new Promise((res) => (img.onload = () => res(null)))
+    if (generation !== sourceGeneration.current) return
+    setPhaseVideoFingerprint((s) => ({ ...s, [phase]: videoFile ? videoFingerprint(videoFile) : null }))
     imageRefs.current[phase] = img
     setCanvasSizes((s) => ({ ...s, [phase]: { width: img.naturalWidth, height: img.naturalHeight } }))
     setLastFrameMeta((m) => ({ ...m, [phase]: { timestampSeconds: frame.timestampSeconds, width: img.naturalWidth, height: img.naturalHeight } }))
@@ -521,6 +556,7 @@ export default function PoseTestPage() {
 
   // After developer selects TARGET_A (manual), call this to analyze contact & recovery and auto-match
   const analyzeRemainingAfterAnchor = async () => {
+    const generation = sourceGeneration.current
     if (!persistentAnchor) {
       setProcessingStatus('No anchor set. Select TARGET_A in Ready canvas first.')
       return
@@ -534,10 +570,13 @@ export default function PoseTestPage() {
       const img = new Image()
       img.src = frame.imageDataUrl
       await new Promise((res) => (img.onload = () => res(null)))
+      if (generation !== sourceGeneration.current) return
+      setPhaseVideoFingerprint((s) => ({ ...s, [phase]: videoFile ? videoFingerprint(videoFile) : null }))
       imageRefs.current[phase] = img
       setCanvasSizes((s) => ({ ...s, [phase]: { width: img.naturalWidth, height: img.naturalHeight } }))
       setLastFrameMeta((m) => ({ ...m, [phase]: { timestampSeconds: frame.timestampSeconds, width: img.naturalWidth, height: img.naturalHeight } }))
       await handleDetectPose(phase)()
+      if (generation !== sourceGeneration.current) return
     }
     setProcessingStatus('Analyzing poses complete')
   }
@@ -824,6 +863,7 @@ export default function PoseTestPage() {
   }
 
   const handleDetectPose = (phase: Phase) => async () => {
+    const generation = sourceGeneration.current
     setError((e) => ({ ...e, [phase]: null }))
     setLoading((l) => ({ ...l, [phase]: true }))
     try {
@@ -838,6 +878,7 @@ export default function PoseTestPage() {
       drawImageFor(canvas, image, size)
       const startTime = performance.now()
       const poseResults = await detectMultiPass(image, { width: image.naturalWidth, height: image.naturalHeight })
+      if (generation !== sourceGeneration.current) return
       const processingTimeMs = Math.round(performance.now() - startTime)
 
       if (!poseResults || poseResults.length === 0) {
@@ -1005,10 +1046,11 @@ export default function PoseTestPage() {
         drawResults(poseResults, canvasRefs.current[phase], imageRefs.current[phase], canvasSizes[phase], selectedPoseIndex[phase])
       }
     } catch (err) {
+      if (generation !== sourceGeneration.current) return
       console.error(err)
       setError((e) => ({ ...e, [phase]: 'Pose detection failed. Check console for details.' }))
     } finally {
-      setLoading((l) => ({ ...l, [phase]: false }))
+      if (generation === sourceGeneration.current) setLoading((l) => ({ ...l, [phase]: false }))
     }
   }
 
@@ -1040,7 +1082,9 @@ export default function PoseTestPage() {
       const { left, top, width, height } = pose.bbox
       if (x >= left && x <= left + width && y >= top && y <= top + height) {
         // Manual selection: always set selected index and mark manual override
-        setSelectedPoseIndex((s) => ({ ...s, [phase]: pose.poseIndex }))
+        setSelectedPoseIndex((s) => phase === 'ready' && s.ready !== pose.poseIndex
+          ? { ready: pose.poseIndex, contact: null, recovery: null }
+          : { ...s, [phase]: pose.poseIndex })
         setPersistentAssignment((pa) => ({ ...pa, [phase]: { persistentPlayerId: persistentAnchor ? persistentAnchor.id : undefined, poseIndex: pose.poseIndex, score: 1, manual: true } }))
         // If selecting in ready phase, set as anchor
         if (phase === 'ready') {
@@ -1191,15 +1235,30 @@ export default function PoseTestPage() {
   const canC = buildCanonical(bioC)
   const canX = buildCanonical(bioX)
 
-  // Preserve eligibility and source metadata so the comparison layer cannot
-  // accidentally turn an experimental or unreliable metric into coaching output.
-  const metrics = [
-    { key: 'Left Knee Flexion', kind: 'knee', ready: canR?.kneeLeft ?? null, contact: canC?.kneeLeft ?? null, recovery: canX?.kneeLeft ?? null },
-    { key: 'Right Knee Flexion', kind: 'knee', ready: canR?.kneeRight ?? null, contact: canC?.kneeRight ?? null, recovery: canX?.kneeRight ?? null },
-    { key: 'Torso Lean', kind: 'orientationSensitive', ready: canR?.torso ?? null, contact: canC?.torso ?? null, recovery: canX?.torso ?? null },
-    { key: 'Stance Width', kind: 'orientationSensitive', ready: canR?.stance ?? null, contact: canC?.stance ?? null, recovery: canX?.stance ?? null },
-    { key: 'Shoulder Tilt', kind: 'orientationSensitive', ready: canR?.shoulder ?? null, contact: canC?.shoulder ?? null, recovery: canX?.shoulder ?? null },
-  ];
+  const canonicalMetrics = { ready: canR, contact: canC, recovery: canX }
+  const currentFingerprint = videoFile ? videoFingerprint(videoFile) : null
+  const sourceMatches = phases.every((phase) => !canonicalMetrics[phase] || phaseVideoFingerprint[phase] === currentFingerprint)
+  const coachingBiomechanics = buildCoachingBiomechanicsPayload(canonicalMetrics, sourceMatches ? currentFingerprint : null)
+  const storedPayload = JSON.stringify(coachingBiomechanics)
+  const hasBridgeInput = !!videoFile || phases.some((phase) => files[phase] || analyses[phase])
+
+  // Development bridge for the next pipeline step. Only the whitelisted payload
+  // is persisted; canonical diagnostics and landmarks never cross this boundary.
+  useEffect(() => {
+    // Opening an empty pose tab must not erase another tab's completed analysis.
+    if (!hasBridgeInput) return
+    const payload = JSON.parse(storedPayload)
+    const hasTrustedMetrics = payload.phases.some((phase: { metrics: unknown[] }) => phase.metrics.length > 0)
+    try {
+      if (hasTrustedMetrics) {
+        window.localStorage.setItem(COACHING_BIOMECHANICS_STORAGE_KEY, storedPayload)
+      } else {
+        clearStoredVideoBiomechanics(() => window.localStorage, currentFingerprint)
+      }
+    } catch {
+      // Storage may be unavailable; pose analysis remains usable without the bridge.
+    }
+  }, [storedPayload, hasBridgeInput, currentFingerprint])
 
   const content = (
     <div className="min-h-screen bg-slate-950 text-slate-100">
@@ -1227,7 +1286,7 @@ export default function PoseTestPage() {
                       <button type="button" onClick={extractCandidateFrames} disabled={extracting || !videoUrl} className="inline-flex items-center justify-center rounded-2xl border border-emerald-500 px-4 py-2 text-sm font-semibold text-emerald-300">
                         {extracting ? 'Extracting...' : 'Extract Frames'}
                       </button>
-                      <button type="button" onClick={() => { setFrames([]); setVideoUrl(null); setVideoFile(null); }} className="inline-flex items-center justify-center rounded-2xl border border-rose-500 px-4 py-2 text-sm text-rose-300">
+                      <button type="button" onClick={() => { resetVideoAnalysis(); setFrames([]); setVideoUrl(null); setVideoFile(null); }} className="inline-flex items-center justify-center rounded-2xl border border-rose-500 px-4 py-2 text-sm text-rose-300">
                         Clear Video
                       </button>
                     </div>
@@ -1330,7 +1389,9 @@ export default function PoseTestPage() {
                         </div>
                         <img
                           ref={(el) => {
-                            imageRefs.current[phase] = el
+                            // A video frame uses a loaded off-DOM image. The empty
+                            // upload preview must not replace it during rerenders.
+                            if (previews[phase]) imageRefs.current[phase] = el
                           }}
                           src={previews[phase] ?? undefined}
                           alt={`${phase} preview`}
@@ -1428,8 +1489,8 @@ export default function PoseTestPage() {
                 analyses={analyses}
                 selectedPoseIndex={selectedPoseIndex}
                 canvasSizes={canvasSizes}
-                metrics={metrics}
-                canonicalMetrics={{ ready: canR, contact: canC, recovery: canX }}
+                coachingBiomechanics={coachingBiomechanics}
+                canonicalMetrics={canonicalMetrics}
                 calculateBiomechanics={calculateBiomechanics}
               />
             </div>

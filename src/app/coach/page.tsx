@@ -2,6 +2,8 @@
 
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { Send } from 'lucide-react'
+import { readStoredCoachingBiomechanics } from '@/lib/coaching-biomechanics'
+import CoachMarkdown from './CoachMarkdown'
 
 type Message = {
   role: 'user' | 'assistant'
@@ -48,14 +50,14 @@ export default function CoachPage() {
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
-    const saved = window.localStorage.getItem('picklepro:user')
-    if (saved) {
-      try {
+    try {
+      const saved = window.localStorage.getItem('picklepro:user')
+      if (saved) {
         const parsed = JSON.parse(saved) as UserProfile
         setProfile((prev) => ({ ...prev, ...parsed }))
-      } catch {
-        // ignore invalid data
       }
+    } catch {
+      // Storage may be unavailable or contain invalid JSON; keep defaults.
     }
   }, [])
 
@@ -87,6 +89,10 @@ export default function CoachPage() {
 
     try {
       console.log("Sending message to /api/coach")
+      const coachingBiomechanics = readStoredCoachingBiomechanics(() => window.localStorage) ?? undefined
+      if (process.env.NODE_ENV !== 'production') {
+        console.info('[dev] /api/coach sanitized coaching biomechanics payload:', JSON.stringify(coachingBiomechanics ?? null))
+      }
       const response = await fetch('/api/coach', {
         method: 'POST',
         headers: {
@@ -99,6 +105,7 @@ export default function CoachPage() {
           weaknesses: weaknessesText,
           dominantHand: profile.dominantHand,
           playStyle: profile.playStyle,
+          coachingBiomechanics,
         }),
         signal: controller.signal,
       })
@@ -192,30 +199,30 @@ export default function CoachPage() {
                             {parsed.diagnosis && (
                               <div>
                                 <h4 className="font-semibold text-[#57FF00] text-xs uppercase tracking-wider mb-1">Diagnosis</h4>
-                                <p className="text-slate-200">{parsed.diagnosis}</p>
+                                <CoachMarkdown>{parsed.diagnosis}</CoachMarkdown>
                               </div>
                             )}
                             {parsed.drills && (
                               <div>
                                 <h4 className="font-semibold text-[#57FF00] text-xs uppercase tracking-wider mb-1">Drills</h4>
-                                <div className="text-slate-200 whitespace-pre-wrap">{parsed.drills}</div>
+                                <CoachMarkdown>{parsed.drills}</CoachMarkdown>
                               </div>
                             )}
                             {parsed.tip && (
                               <div>
                                 <h4 className="font-semibold text-[#57FF00] text-xs uppercase tracking-wider mb-1">Practical Tip</h4>
-                                <p className="text-slate-200">{parsed.tip}</p>
+                                <CoachMarkdown>{parsed.tip}</CoachMarkdown>
                               </div>
                             )}
                             {parsed.nextStep && (
                               <div>
                                 <h4 className="font-semibold text-[#57FF00] text-xs uppercase tracking-wider mb-1">Next Step</h4>
-                                <p className="text-slate-200">{parsed.nextStep}</p>
+                                <CoachMarkdown>{parsed.nextStep}</CoachMarkdown>
                               </div>
                             )}
                           </div>
                         ) : (
-                          <p>{message.content}</p>
+                          isAssistant ? <CoachMarkdown>{message.content}</CoachMarkdown> : <p>{message.content}</p>
                         )}
                       </div>
                     </div>

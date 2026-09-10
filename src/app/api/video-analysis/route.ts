@@ -7,6 +7,7 @@ import path from 'path'
 import sharp from 'sharp'
 import os from 'os'
 import fsSync from 'fs'
+import { addCoachingReviewNotice, formatCoachingBiomechanicsForPrompt, readVideoBiomechanicsForm, type CoachingBiomechanicsPayload } from '@/lib/coaching-biomechanics'
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -408,12 +409,13 @@ async function analyzeTrackedPlayer(
   notes: string,
   userProfile: any,
   targetPlayerSelection: string,
-  targetPlayerDescription: string
+  targetPlayerDescription: string,
+  coachingBiomechanics: CoachingBiomechanicsPayload | null
 ): Promise<any> {
   console.log('Starting phase 2: analyze tracked player')
   const imageContents = await prepareFrameImages(frames)
 
-  const systemPrompt = `You are an elite pickleball coach analyzing video footage for a single identified player. Analyze ONLY the player described by the structured identification object. Do not re-identify the player or provide any additional player selection guidance.`
+  const systemPrompt = `You are an elite pickleball coach analyzing video footage for a single identified player. Analyze ONLY the player described by the structured identification object. Do not re-identify the player or provide any additional player selection guidance. Use supplied COACHING ELIGIBLE biomechanics as trusted facts. Treat COACHING ELIGIBLE — REVIEW biomechanics cautiously and acknowledge uncertainty when material. Never invent or infer omitted biomechanics measurements.`
 
   const analysisPrompt = `Analyzing only the player described by the structured identification object below:
 
@@ -436,6 +438,8 @@ User Profile:
 User Notes: "${notes}"
 Category: ${category}
 Target Player Selection: ${targetPlayerSelection}
+
+${formatCoachingBiomechanicsForPrompt(coachingBiomechanics)}
 
 Analyze the selected player using the exact format required by the existing frontend:
 
@@ -500,13 +504,13 @@ Keep all feedback concise, technical, and actionable.`
     console.error('Raw analysis excerpt:', analysis.substring(0, 500))
   }
 
-  return parsedAnalysis
+  return { ...parsedAnalysis, diagnosis: addCoachingReviewNotice(parsedAnalysis.diagnosis, coachingBiomechanics) }
 }
 
-async function analyzeFramesWithVision(frames: string[], category: string, notes: string, userProfile: any, targetPlayerSelection: string, targetPlayerDescription: string): Promise<any> {
+async function analyzeFramesWithVision(frames: string[], category: string, notes: string, userProfile: any, targetPlayerSelection: string, targetPlayerDescription: string, coachingBiomechanics: CoachingBiomechanicsPayload | null): Promise<any> {
   try {
     const identifiedPlayer = await identifyTargetPlayer(frames, targetPlayerDescription, notes)
-    const trackedAnalysis = await analyzeTrackedPlayer(identifiedPlayer, frames, category, notes, userProfile, targetPlayerSelection, targetPlayerDescription)
+    const trackedAnalysis = await analyzeTrackedPlayer(identifiedPlayer, frames, category, notes, userProfile, targetPlayerSelection, targetPlayerDescription, coachingBiomechanics)
     return {
       ...trackedAnalysis,
       targetPlayerMetadata: {
@@ -536,6 +540,7 @@ export async function POST(request: NextRequest) {
     const category = formData.get('category') as string
     const notes = formData.get('notes') as string
     const userProfile = JSON.parse(formData.get('userProfile') as string || '{}')
+    const coachingBiomechanics = readVideoBiomechanicsForm(formData)
 
     console.log('Form data parsed:', { hasVideo: !!videoFile, category, notes: !!notes, hasProfile: !!userProfile })
 
@@ -605,7 +610,7 @@ export async function POST(request: NextRequest) {
       console.log('Starting OpenAI Vision analysis...')
       const targetPlayerSelection = formData.get('targetPlayerSelection') as string || 'auto-detect'
       const targetPlayerDescription = formData.get('targetPlayerDescription') as string || ''
-      const analysis = await analyzeFramesWithVision(framePaths, category, notes, userProfile, targetPlayerSelection, targetPlayerDescription)
+      const analysis = await analyzeFramesWithVision(framePaths, category, notes, userProfile, targetPlayerSelection, targetPlayerDescription, coachingBiomechanics)
       console.log('Analysis completed successfully')
 
       return NextResponse.json({

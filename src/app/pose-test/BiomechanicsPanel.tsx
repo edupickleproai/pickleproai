@@ -1,49 +1,22 @@
 import React from 'react'
+import { evaluateCoachingComparison, type CoachingMetricName } from '@/lib/coaching-biomechanics'
 
-export default function BiomechanicsPanel({ phases, analyses, selectedPoseIndex, canvasSizes, metrics, calculateBiomechanics, canonicalMetrics }: any) {
+export default function BiomechanicsPanel({ phases, analyses, selectedPoseIndex, canvasSizes, coachingBiomechanics, calculateBiomechanics, canonicalMetrics }: any) {
   const confLabel = (v: number) => {
     if (v >= 0.7) return 'HIGH'
     if (v >= 0.4) return 'MEDIUM'
     return 'LOW'
   }
 
-  type ComparisonStatus = 'COACHING ELIGIBLE' | 'COACHING ELIGIBLE — REVIEW' | 'NOT RELIABLE' | 'N/A'
-  type ComparisonResult = { display: string; status: ComparisonStatus; reason: string; warnings: string[] }
+  const comparisonDefinitions: Array<{ label: string; metric: CoachingMetricName; key: string }> = [
+    { label: 'Left Knee Flexion', metric: 'leftKneeFlexion', key: 'kneeLeft' },
+    { label: 'Right Knee Flexion', metric: 'rightKneeFlexion', key: 'kneeRight' },
+    { label: 'Torso Lean', metric: 'torsoLean', key: 'torso' },
+    { label: 'Stance Width', metric: 'stanceWidth', key: 'stance' },
+    { label: 'Shoulder Tilt', metric: 'shoulderTiltMagnitude', key: 'shoulder' },
+  ]
 
-  const compareMetrics = (from: any, to: any, fromLabel: string, toLabel: string, kind: string): ComparisonResult => {
-    if (!from || !to) return { display: 'N/A', status: 'N/A', reason: `No metric is available for ${!from ? fromLabel : toLabel}.`, warnings: [] }
-    if (!from.coachingEligible || !to.coachingEligible) {
-      const reasons = [
-        !from.coachingEligible ? `${fromLabel}: ${from.reason || 'NOT RELIABLE'}` : null,
-        !to.coachingEligible ? `${toLabel}: ${to.reason || 'NOT RELIABLE'}` : null,
-      ].filter(Boolean)
-      return { display: 'NOT RELIABLE', status: 'NOT RELIABLE', reason: reasons.join(' '), warnings: [] }
-    }
-    if (!Number.isFinite(from.value) || !Number.isFinite(to.value)) {
-      return { display: 'N/A', status: 'N/A', reason: 'One or both measurements are not finite.', warnings: [] }
-    }
-    if (from.source !== to.source || from.unit !== to.unit) {
-      return { display: 'N/A', status: 'N/A', reason: `Incompatible sources or units (${from.source}/${from.unit} vs ${to.source}/${to.unit}).`, warnings: [] }
-    }
-    const fromOrientation = from.diagnostics?.orientationSignature
-    const toOrientation = to.diagnostics?.orientationSignature
-    if (kind === 'orientationSensitive' && fromOrientation && toOrientation) {
-      const relativeChange = (a: number, b: number) => Math.max(a, b) / Math.max(Math.min(a, b), 0.001)
-      const shoulderSpanDrift = relativeChange(fromOrientation.shoulderSpanToTorso, toOrientation.shoulderSpanToTorso)
-      const hipSpanDrift = relativeChange(fromOrientation.hipSpanToTorso, toOrientation.hipSpanToTorso)
-      if (shoulderSpanDrift > 1.35 || hipSpanDrift > 1.35) {
-        return { display: 'NOT RELIABLE', status: 'NOT RELIABLE', reason: 'Cross-phase projected shoulder/hip geometry changed too much for a compatible orientation-sensitive comparison.', warnings: [] }
-      }
-    }
-    const change = to.value - from.value
-    const warnings: string[] = []
-    if (kind === 'knee' && Math.abs(change) > 45) {
-      warnings.push('Large knee change: review phase selection, player match, and landmark geometry; the measurement is not automatically rejected.')
-    }
-    return { display: `${change.toFixed(2)}${from.unit}`, status: warnings.length > 0 ? 'COACHING ELIGIBLE — REVIEW' : 'COACHING ELIGIBLE', reason: '', warnings }
-  }
-
-  const statusClass = (status: ComparisonStatus) => status === 'COACHING ELIGIBLE'
+  const statusClass = (status: string) => status === 'COACHING ELIGIBLE'
     ? 'text-emerald-300'
     : status === 'COACHING ELIGIBLE — REVIEW'
       ? 'text-amber-300'
@@ -51,14 +24,11 @@ export default function BiomechanicsPanel({ phases, analyses, selectedPoseIndex,
         ? 'text-rose-400'
         : 'text-slate-400'
 
-  const reviewWarningsForPhase = (metricKey: string, phase: string) => {
-    const metric = metrics.find((candidate: any) => candidate.key === metricKey)
-    if (!metric || phase === 'ready') return []
-    const result = phase === 'contact'
-      ? compareMetrics(metric.ready, metric.contact, 'Ready', 'Contact', metric.kind)
-      : compareMetrics(metric.contact, metric.recovery, 'Contact', 'Recovery', metric.kind)
-    return result.status === 'COACHING ELIGIBLE — REVIEW' ? result.warnings : []
-  }
+  const warningText = () => 'Large knee change: review phase selection, player match, and landmark geometry; the measurement is not automatically rejected.'
+
+  const reviewWarningsForPhase = (metric: CoachingMetricName, phase: string) => coachingBiomechanics.phases
+    .find((entry: any) => entry.phase === phase)?.metrics
+    .find((entry: any) => entry.metric === metric && entry.status === 'coaching_eligible_review')?.warnings ?? []
 
   return (
     <div className="rounded-3xl border border-slate-800 bg-slate-950/70 p-6">
@@ -215,18 +185,19 @@ export default function BiomechanicsPanel({ phases, analyses, selectedPoseIndex,
         <div className="mt-3 rounded-2xl border border-slate-800 bg-slate-900/60 p-4 text-sm text-slate-300">
           <div className="font-semibold text-slate-100 mb-2">Movement Comparison</div>
           <div className="space-y-2">
-            {metrics.map((m: any) => {
-              const readyToContact = compareMetrics(m.ready, m.contact, 'Ready', 'Contact', m.kind)
-              const contactToRecovery = compareMetrics(m.contact, m.recovery, 'Contact', 'Recovery', m.kind)
+            {comparisonDefinitions.map((definition) => {
+              const readyToContact = evaluateCoachingComparison(canonicalMetrics.ready?.[definition.key], canonicalMetrics.contact?.[definition.key], definition.metric)
+              const contactToRecovery = evaluateCoachingComparison(canonicalMetrics.contact?.[definition.key], canonicalMetrics.recovery?.[definition.key], definition.metric)
+              const display = (result: any) => result.delta === null || !result.unit ? result.status : `${result.delta.toFixed(2)}${result.unit === 'degrees' ? '°' : 'x'}`
               return (
-                <div key={m.key} className="rounded-xl border border-slate-800 p-2">
-                  <div className="font-medium text-slate-300">{m.key}</div>
-                  <div className="mt-1 text-slate-200">Ready -&gt; Contact: {readyToContact.display} <span className={`ml-2 font-semibold ${statusClass(readyToContact.status)}`}>{readyToContact.status}</span></div>
+                <div key={definition.metric} className="rounded-xl border border-slate-800 p-2">
+                  <div className="font-medium text-slate-300">{definition.label}</div>
+                  <div className="mt-1 text-slate-200">Ready -&gt; Contact: {display(readyToContact)} <span className={`ml-2 font-semibold ${statusClass(readyToContact.status)}`}>{readyToContact.status}</span></div>
                   {readyToContact.reason ? <div className="text-xs text-slate-400">{readyToContact.reason}</div> : null}
-                  {readyToContact.warnings?.map((warning: string) => <div key={warning} className="text-xs text-amber-400">WARNING: {warning}</div>)}
-                  <div className="mt-1 text-slate-200">Contact -&gt; Recovery: {contactToRecovery.display} <span className={`ml-2 font-semibold ${statusClass(contactToRecovery.status)}`}>{contactToRecovery.status}</span></div>
+                  {readyToContact.warnings.map((warning) => <div key={warning} className="text-xs text-amber-400">WARNING: {warningText()}</div>)}
+                  <div className="mt-1 text-slate-200">Contact -&gt; Recovery: {display(contactToRecovery)} <span className={`ml-2 font-semibold ${statusClass(contactToRecovery.status)}`}>{contactToRecovery.status}</span></div>
                   {contactToRecovery.reason ? <div className="text-xs text-slate-400">{contactToRecovery.reason}</div> : null}
-                  {contactToRecovery.warnings?.map((warning: string) => <div key={warning} className="text-xs text-amber-400">WARNING: {warning}</div>)}
+                  {contactToRecovery.warnings.map((warning) => <div key={warning} className="text-xs text-amber-400">WARNING: {warningText()}</div>)}
                 </div>
               )
             })}
@@ -245,8 +216,8 @@ export default function BiomechanicsPanel({ phases, analyses, selectedPoseIndex,
                   const p = analysis.poses.find((x: any) => x.poseIndex === sel)
                   if (p) detectionSource = p.detectionSource ?? 'FULL_FRAME'
                 }
-                const leftKneeReviewWarnings = reviewWarningsForPhase('Left Knee Flexion', phase)
-                const rightKneeReviewWarnings = reviewWarningsForPhase('Right Knee Flexion', phase)
+                const leftKneeReviewWarnings = reviewWarningsForPhase('leftKneeFlexion', phase)
+                const rightKneeReviewWarnings = reviewWarningsForPhase('rightKneeFlexion', phase)
                 return (
                   <div key={`coach-${phase}`} className="rounded-2xl border border-slate-800 bg-slate-900/60 p-3">
                     <div className="font-semibold text-slate-100">{phase === 'ready' ? 'READY' : phase === 'contact' ? 'CONTACT' : 'RECOVERY'}</div>
@@ -254,10 +225,10 @@ export default function BiomechanicsPanel({ phases, analyses, selectedPoseIndex,
                       <div className="mt-2 text-sm text-slate-200">
                         <div className="mb-1"><strong>Knee Flexion</strong></div>
                         {canonical.kneeLeft && canonical.kneeLeft.coachingEligible ? (
-                          <div className="text-sm">Left: {canonical.kneeLeft.value.toFixed(1)}° • {canonical.kneeLeft.source.toUpperCase()} • {canonical.kneeLeft.reliability} • <span className={leftKneeReviewWarnings.length > 0 ? 'font-semibold text-amber-300' : 'text-emerald-300'}>{leftKneeReviewWarnings.length > 0 ? 'COACHING ELIGIBLE — REVIEW' : 'COACHING ELIGIBLE'}</span>{leftKneeReviewWarnings.map((warning: string) => <div key={warning} className="text-xs text-amber-400">WARNING: {warning}</div>)}</div>
+                          <div className="text-sm">Left: {canonical.kneeLeft.value.toFixed(1)}° • {canonical.kneeLeft.source.toUpperCase()} • {canonical.kneeLeft.reliability} • <span className={leftKneeReviewWarnings.length > 0 ? 'font-semibold text-amber-300' : 'text-emerald-300'}>{leftKneeReviewWarnings.length > 0 ? 'COACHING ELIGIBLE — REVIEW' : 'COACHING ELIGIBLE'}</span>{leftKneeReviewWarnings.map((warning: string) => <div key={warning} className="text-xs text-amber-400">WARNING: {warningText()}</div>)}</div>
                         ) : <div className="text-xs text-slate-400">Left: NOT RELIABLE • {canonical.kneeLeft?.reason ?? ''}</div>}
                         {canonical.kneeRight && canonical.kneeRight.coachingEligible ? (
-                          <div className="text-sm">Right: {canonical.kneeRight.value.toFixed(1)}° • {canonical.kneeRight.source.toUpperCase()} • {canonical.kneeRight.reliability} • <span className={rightKneeReviewWarnings.length > 0 ? 'font-semibold text-amber-300' : 'text-emerald-300'}>{rightKneeReviewWarnings.length > 0 ? 'COACHING ELIGIBLE — REVIEW' : 'COACHING ELIGIBLE'}</span>{rightKneeReviewWarnings.map((warning: string) => <div key={warning} className="text-xs text-amber-400">WARNING: {warning}</div>)}</div>
+                          <div className="text-sm">Right: {canonical.kneeRight.value.toFixed(1)}° • {canonical.kneeRight.source.toUpperCase()} • {canonical.kneeRight.reliability} • <span className={rightKneeReviewWarnings.length > 0 ? 'font-semibold text-amber-300' : 'text-emerald-300'}>{rightKneeReviewWarnings.length > 0 ? 'COACHING ELIGIBLE — REVIEW' : 'COACHING ELIGIBLE'}</span>{rightKneeReviewWarnings.map((warning: string) => <div key={warning} className="text-xs text-amber-400">WARNING: {warningText()}</div>)}</div>
                         ) : <div className="text-xs text-slate-400">Right: NOT RELIABLE • {canonical.kneeRight?.reason ?? ''}</div>}
 
                         <div className="mt-2 mb-1"><strong>Torso Lean</strong></div>
