@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "test:phases": "node --test tests/phase-detection.test.cjs",
     "test:biomechanics": "node --test tests/coaching-biomechanics.test.cjs",
     "dev": "next dev",
     "build": "next build",

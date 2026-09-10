@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, type ChangeEvent } from 'react'
 import BiomechanicsPanel from './BiomechanicsPanel'
 import type { NormalizedLandmark } from '@mediapipe/tasks-vision'
+import { detectPhases, matchPhaseTarget, overridePhase, phaseGeometry, scorePlayerMatch, type PhaseResult, type PhaseCandidate } from '@/lib/phase-detection'
 import { buildCoachingBiomechanicsPayload, clearStoredVideoBiomechanics, COACHING_BIOMECHANICS_STORAGE_KEY, videoFingerprint } from '@/lib/coaching-biomechanics'
 
 const MODEL_URL =
@@ -377,6 +378,11 @@ export default function PoseTestPage() {
   const [persistentAnchor, setPersistentAnchor] = useState<null | { id: string; features: any }>(null)
   const [persistentAssignment, setPersistentAssignment] = useState<Record<Phase, { persistentPlayerId?: string; poseIndex?: number; score?: number; manual?: boolean }>>({ ready: {}, contact: {}, recovery: {} } as any)
   const [matchCandidates, setMatchCandidates] = useState<Record<Phase, Array<any>>>({ ready: [], contact: [], recovery: [] } as any)
+  const [autoResult, setAutoResult] = useState<PhaseResult | null>(null)
+  const [autoBusy, setAutoBusy] = useState(false)
+  const [paddleHand, setPaddleHand] = useState<'left' | 'right'>('right')
+  const [selectionOrigin, setSelectionOrigin] = useState<Record<Phase, string>>({ ready: 'MANUAL', contact: 'MANUAL', recovery: 'MANUAL' })
+  const autoCache = useRef(new Map<string, { image: HTMLImageElement; poses: PoseResult[]; poseIndex: number | null; score: number }>())
 
   const imageRefs = useRef<Record<Phase, HTMLImageElement | null>>({} as any)
   const canvasRefs = useRef<Record<Phase, HTMLCanvasElement | null>>({} as any)
@@ -385,6 +391,10 @@ export default function PoseTestPage() {
   const [phaseVideoFingerprint, setPhaseVideoFingerprint] = useState<Record<Phase, string | null>>({ ready: null, contact: null, recovery: null })
 
   const resetVideoAnalysis = () => {
+    setAutoResult(null)
+    setAutoBusy(false)
+    autoCache.current.clear()
+    setSelectionOrigin({ ready: 'MANUAL', contact: 'MANUAL', recovery: 'MANUAL' })
     clearStoredVideoBiomechanics(() => window.localStorage, videoFile ? videoFingerprint(videoFile) : null)
     sourceGeneration.current += 1
     setAnalyses({ ready: null, contact: null, recovery: null })
@@ -423,6 +433,8 @@ export default function PoseTestPage() {
   }, [])
 
   const handleFileChange = (phase: Phase) => (event: ChangeEvent<HTMLInputElement>) => {
+    setAutoResult(null)
+    autoCache.current.clear()
     sourceGeneration.current += 1
     setPhaseVideoFingerprint((s) => ({ ...s, [phase]: null }))
     setAnalyses((a) => ({ ...a, [phase]: null }))
@@ -524,7 +536,17 @@ export default function PoseTestPage() {
   }
 
   const assignFrameToPhase = (phase: Phase, frameId: string) => {
-    setSelectedFrameByPhase((s) => ({ ...s, [phase]: frameId }))
+    if (autoBusy) return
+    sourceGeneration.current += 1
+    setLoading({ ready: false, contact: false, recovery: false })
+    setSelectedFrameByPhase((s) => overridePhase(s, phase, frameId))
+    setSelectionOrigin((s) => overridePhase(s, phase, 'MANUAL OVERRIDE'))
+    setAnalyses((s) => ({ ...s, [phase]: null }))
+    setSelectedPoseIndex((s) => ({ ...s, [phase]: null }))
+    setLastFrameMeta((s) => ({ ...s, [phase]: null }))
+    imageRefs.current[phase] = null
+    const canvas = canvasRefs.current[phase]
+    canvas?.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height)
   }
 
   // Analyze only Ready first so the developer can manually select TARGET_A.
@@ -826,50 +848,92 @@ export default function PoseTestPage() {
     return { center: { x: normCenterX, y: normCenterY }, normWidth, normHeight, area, landmarks, confidence: avgVis }
   }
 
-  // Matching score between anchor and candidate (0..1)
-  const scoreMatch = (anchor: any, cand: any) => {
-    // center distance score
-    const dx = anchor.center.x - cand.center.x
-    const dy = anchor.center.y - cand.center.y
-    const dist = Math.hypot(dx, dy)
-    const centerScore = 1 - Math.min(dist / 1.41421356, 1)
-
-    // size/area similarity
-    const maxArea = Math.max(anchor.area, cand.area)
-    const sizeScore = maxArea > 0 ? 1 - Math.min(Math.abs(anchor.area - cand.area) / maxArea, 1) : 0
-
-    // landmark similarity: average normalized point distance
-    const pairs = Math.min(anchor.landmarks.length, cand.landmarks.length)
-    let lmDist = 1
-    if (pairs > 0) {
-      let sum = 0
-      for (let i = 0; i < pairs; i++) {
-        const a = anchor.landmarks[i]
-        const b = cand.landmarks[i]
-        const d = Math.hypot(a.x - b.x, a.y - b.y)
-        sum += d
+  const runAutomaticPhases = async () => {
+    if (!persistentAnchor || autoBusy) return
+    const generation = ++sourceGeneration.current
+    setAutoBusy(true)
+    setAutoResult(null)
+    autoCache.current.clear()
+    const candidates: PhaseCandidate[] = []
+    try {
+      for (const [index, frame] of frames.entries()) {
+        if (generation !== sourceGeneration.current) return
+        setProcessingStatus(`Matching TARGET_A: ${index + 1}/${frames.length}`)
+        const image = new Image()
+        image.src = frame.imageDataUrl
+        await image.decode()
+        const size = { width: image.naturalWidth, height: image.naturalHeight }
+        const poses = await detectMultiPass(image, size)
+        if (generation !== sourceGeneration.current) return
+        const match = matchPhaseTarget(persistentAnchor.features, poses.map((pose) => ({ poseIndex: pose.poseIndex, features: extractFeatures(pose, size) })))
+        const target = poses.find((p) => p.poseIndex === match.poseIndex)
+        autoCache.current.set(frame.frameId, { image, poses, poseIndex: match.poseIndex, score: match.score })
+        candidates.push({ frameId: frame.frameId, timestamp: frame.timestampSeconds, targetScore: match.score, matched: match.reliable,
+          ...(target ? phaseGeometry(target.landmarks, size.width / size.height, paddleHand) : { reach: null, wrist: null }) })
+        await new Promise((resolve) => setTimeout(resolve, 0))
       }
-      const avg = sum / pairs
-      lmDist = 1 - Math.min(avg / 0.5, 1)
+      if (generation !== sourceGeneration.current) return
+      setAutoResult(detectPhases(candidates))
+      setProcessingStatus('Automatic proposals ready for visual review')
+    } catch {
+      if (generation === sourceGeneration.current) setProcessingStatus('Automatic detection failed. Manual selection remains available.')
+    } finally {
+      if (generation === sourceGeneration.current) setAutoBusy(false)
     }
-
-    // weights
-    const wCenter = 0.5
-    const wSize = 0.25
-    const wLandmark = 0.25
-
-    const overall = wCenter * centerScore + wSize * sizeScore + wLandmark * lmDist
-    return { overall, centerScore, sizeScore, lmDist }
   }
 
-  const handleDetectPose = (phase: Phase) => async () => {
+  const acceptAutomaticPhases = () => {
+    if (autoResult?.proposals.length !== 3) return
+    setSelectedFrameByPhase(Object.fromEntries(autoResult.proposals.map((p) => [p.phase, p.frameId])) as Record<Phase, string>)
+    setSelectionOrigin({ ready: 'AUTO', contact: 'AUTO', recovery: 'AUTO' })
+    setAnalyses({ ready: null, contact: null, recovery: null })
+    setSelectedPoseIndex({ ready: null, contact: null, recovery: null })
+    clearStoredVideoBiomechanics(() => window.localStorage, videoFile ? videoFingerprint(videoFile) : null)
+    setLastFrameMeta({ ready: null, contact: null, recovery: null })
+    imageRefs.current = { ready: null, contact: null, recovery: null }
+    Object.values(canvasRefs.current).forEach((canvas) => canvas?.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height))
+  }
+
+  const analyzeAcceptedPhases = async () => {
+    const selected = phases.map((phase) => frames.find((f) => f.frameId === selectedFrameByPhase[phase]))
+    if (selected.some((f) => !f) || !(selected[0]!.timestampSeconds < selected[1]!.timestampSeconds && selected[1]!.timestampSeconds < selected[2]!.timestampSeconds)) {
+      setProcessingStatus('Select three distinct frames in Ready → Contact → Recovery order first.')
+      return
+    }
+    if (selected.some((f) => autoCache.current.get(f!.frameId)?.poseIndex == null)) {
+      setProcessingStatus('TARGET_A is unresolved in a selected frame. Use the manual analysis and player-selection fallback.')
+      return
+    }
+    const generation = sourceGeneration.current
+    setAutoBusy(true)
+    try {
+      for (const [index, phase] of phases.entries()) {
+        const frame = selected[index]!
+        const entry = autoCache.current.get(frame.frameId)!
+        imageRefs.current[phase] = entry.image
+        const size = { width: entry.image.naturalWidth, height: entry.image.naturalHeight }
+        setCanvasSizes((s) => ({ ...s, [phase]: size }))
+        setLastFrameMeta((s) => ({ ...s, [phase]: { timestampSeconds: frame.timestampSeconds, ...size } }))
+        setPhaseVideoFingerprint((s) => ({ ...s, [phase]: videoFile ? videoFingerprint(videoFile) : null }))
+        await handleDetectPose(phase, { ...entry, poseIndex: entry.poseIndex! })()
+        if (generation !== sourceGeneration.current) return
+      }
+      setProcessingStatus('Selected frames analyzed for TARGET_A; existing biomechanics reliability gates applied')
+    } finally {
+      if (generation === sourceGeneration.current) setAutoBusy(false)
+    }
+  }
+
+  const scoreMatch = scorePlayerMatch
+
+  const handleDetectPose = (phase: Phase, automatic?: { image: HTMLImageElement; poses: PoseResult[]; poseIndex: number; score: number }) => async () => {
     const generation = sourceGeneration.current
     setError((e) => ({ ...e, [phase]: null }))
     setLoading((l) => ({ ...l, [phase]: true }))
     try {
-      const image = imageRefs.current[phase]
+      const image = automatic?.image ?? imageRefs.current[phase]
       const canvas = canvasRefs.current[phase]
-      const size = canvasSizes[phase]
+      const size = image ? { width: image.naturalWidth, height: image.naturalHeight } : canvasSizes[phase]
       if (!image) {
         setError((e) => ({ ...e, [phase]: 'Upload an image before detecting pose.' }))
         return
@@ -877,7 +941,7 @@ export default function PoseTestPage() {
 
       drawImageFor(canvas, image, size)
       const startTime = performance.now()
-      const poseResults = await detectMultiPass(image, { width: image.naturalWidth, height: image.naturalHeight })
+      const poseResults = automatic?.poses ?? await detectMultiPass(image, { width: image.naturalWidth, height: image.naturalHeight })
       if (generation !== sourceGeneration.current) return
       const processingTimeMs = Math.round(performance.now() - startTime)
 
@@ -1022,7 +1086,10 @@ export default function PoseTestPage() {
 
       // After analysis, if we have an anchor and this is not the ready phase,
       // attempt automatic matching unless user already manually overrode.
-      if (persistentAnchor && phase !== 'ready') {
+      if (automatic) {
+        setSelectedPoseIndex((s) => ({ ...s, [phase]: automatic.poseIndex }))
+        setPersistentAssignment((s) => ({ ...s, [phase]: { persistentPlayerId: 'TARGET_A', poseIndex: automatic.poseIndex, score: automatic.score, manual: false } }))
+      } else if (persistentAnchor && phase !== 'ready') {
         const anchor = persistentAnchor.features
         const size = canvasSizes[phase]
         const candidates = poseResults.map((p) => ({ pose: p, features: extractFeatures(p, size) }))
@@ -1070,6 +1137,7 @@ export default function PoseTestPage() {
 
   // per-phase canvas click handler and redraw logic
   const handleCanvasClickPhase = (phase: Phase) => (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (autoBusy) return
     const canvas = canvasRefs.current[phase]
     const analysis = analyses[phase]
     if (!canvas || !analysis) return
@@ -1081,6 +1149,7 @@ export default function PoseTestPage() {
     for (const pose of analysis.poses) {
       const { left, top, width, height } = pose.bbox
       if (x >= left && x <= left + width && y >= top && y <= top + height) {
+        setSelectionOrigin((s) => overridePhase(s, phase, 'MANUAL OVERRIDE'))
         // Manual selection: always set selected index and mark manual override
         setSelectedPoseIndex((s) => phase === 'ready' && s.ready !== pose.poseIndex
           ? { ready: pose.poseIndex, contact: null, recovery: null }
@@ -1089,6 +1158,10 @@ export default function PoseTestPage() {
         // If selecting in ready phase, set as anchor
         if (phase === 'ready') {
           const features = extractFeatures(pose, canvasSizes[phase])
+          sourceGeneration.current += 1
+          setAutoResult(null)
+          setAutoBusy(false)
+          autoCache.current.clear()
           setPersistentAnchor({ id: 'TARGET_A', features })
           setPersistentAssignment((pa) => ({ ...pa, ready: { persistentPlayerId: 'TARGET_A', poseIndex: pose.poseIndex, score: 1, manual: true } }))
         }
@@ -1283,7 +1356,7 @@ export default function PoseTestPage() {
                         <input type="file" accept="video/*" onChange={handleVideoChange} className="hidden" />
                         Choose Video
                       </label>
-                      <button type="button" onClick={extractCandidateFrames} disabled={extracting || !videoUrl} className="inline-flex items-center justify-center rounded-2xl border border-emerald-500 px-4 py-2 text-sm font-semibold text-emerald-300">
+                      <button type="button" onClick={extractCandidateFrames} disabled={autoBusy || extracting || !videoUrl} className="inline-flex items-center justify-center rounded-2xl border border-emerald-500 px-4 py-2 text-sm font-semibold text-emerald-300">
                         {extracting ? 'Extracting...' : 'Extract Frames'}
                       </button>
                       <button type="button" onClick={() => { resetVideoAnalysis(); setFrames([]); setVideoUrl(null); setVideoFile(null); }} className="inline-flex items-center justify-center rounded-2xl border border-rose-500 px-4 py-2 text-sm text-rose-300">
@@ -1319,10 +1392,10 @@ export default function PoseTestPage() {
                     </div>
 
                     <div className="mt-4 flex items-center gap-3">
-                      <button type="button" onClick={analyzeSelectedFrames} disabled={!selectedFrameByPhase.ready} className="inline-flex items-center justify-center rounded-2xl bg-emerald-500 px-6 py-3 text-base font-semibold text-slate-950">
+                      <button type="button" onClick={analyzeSelectedFrames} disabled={autoBusy || loading.ready || !selectedFrameByPhase.ready} className="inline-flex items-center justify-center rounded-2xl bg-emerald-500 px-6 py-3 text-base font-semibold text-slate-950">
                         Analyze Ready Frame
                       </button>
-                      <button type="button" onClick={analyzeRemainingAfterAnchor} disabled={!selectedFrameByPhase.contact || !selectedFrameByPhase.recovery} className="inline-flex items-center justify-center rounded-2xl border border-emerald-500 px-6 py-3 text-base font-semibold text-emerald-300">
+                      <button type="button" onClick={analyzeRemainingAfterAnchor} disabled={autoBusy || loading.contact || loading.recovery || !selectedFrameByPhase.contact || !selectedFrameByPhase.recovery} className="inline-flex items-center justify-center rounded-2xl border border-emerald-500 px-6 py-3 text-base font-semibold text-emerald-300">
                         Analyze Contact & Recovery (after TARGET_A)
                       </button>
                     </div>
@@ -1332,6 +1405,34 @@ export default function PoseTestPage() {
             </div>
           </div>
 
+              {frames.length > 0 && <section className="rounded-3xl border border-slate-700 bg-slate-950 p-6 space-y-3">
+                <h2 className="text-xl font-semibold">Automatic Phase Detection</h2>
+                <p className="text-sm text-slate-300">Assign one clear frame to Ready, analyze it, and click the physical player once to identify TARGET_A. Then scan the video. Manual assignment remains available.</p>
+                <label className="block">Paddle hand <select aria-label="Paddle hand" value={paddleHand} disabled={autoBusy} onChange={(e) => { setPaddleHand(e.target.value as 'left' | 'right'); setAutoResult(null); autoCache.current.clear() }} className="bg-slate-800 p-2"><option value="right">Right</option><option value="left">Left</option></select></label>
+                <button type="button" disabled={!persistentAnchor || autoBusy || extracting || phases.some((p) => loading[p])} onClick={runAutomaticPhases} className="rounded bg-emerald-600 p-3 disabled:opacity-40">{autoBusy ? 'Scanning / analyzing…' : 'Propose automatic phases'}</button>
+                {autoResult && <>
+                  {autoResult.reasons.map((reason) => <p key={reason} className="text-sm text-amber-200">{reason}</p>)}
+                  {!autoResult.proposals.length && <p>Unresolved — keep manual selection.</p>}
+                  <div className="grid gap-4 md:grid-cols-3">{autoResult.proposals.map((proposal) => {
+                    const frame = frames.find((f) => f.frameId === proposal.frameId)!
+                    const entry = autoCache.current.get(proposal.frameId)
+                    const target = entry?.poses.find((p) => p.poseIndex === entry.poseIndex)
+                    return <article key={proposal.phase} className="border border-slate-600 p-3" aria-label={`Automatic ${proposal.phase}`}>
+                      <h3 className="capitalize font-semibold">{proposal.phase}: {proposal.timestamp.toFixed(2)}s</h3>
+                      <div className="relative"><img src={frame.imageDataUrl} alt={`Automatic ${proposal.phase} at ${proposal.timestamp.toFixed(2)} seconds`} />
+                        {target && entry && <div className="absolute border-2 border-emerald-400 pointer-events-none" style={{ left: `${100 * target.bbox.left / entry.image.naturalWidth}%`, top: `${100 * target.bbox.top / entry.image.naturalHeight}%`, width: `${100 * target.bbox.width / entry.image.naturalWidth}%`, height: `${100 * target.bbox.height / entry.image.naturalHeight}%` }}><span className="bg-slate-950 text-xs text-emerald-300">TARGET_A</span></div>}
+                      </div>
+                      <p>Confidence: {proposal.confidence} · Score: {proposal.score.toFixed(2)}</p>
+                      <ul className="list-disc pl-4 text-sm">{proposal.reasons.map((r) => <li key={r}>{r}</li>)}</ul>
+                    </article>
+                  })}</div>
+                  {autoResult.proposals.length === 3 && <button disabled={autoBusy} type="button" onClick={acceptAutomaticPhases} className="rounded bg-emerald-600 p-3">Accept proposals after visual review</button>}
+                  <details><summary>Candidate evidence (development)</summary><table className="text-xs"><thead><tr><th>Time</th><th>Target matched</th><th>Match score</th><th>Arm reach / torso</th><th>Local motion</th></tr></thead><tbody>{autoResult.candidates.map((c) => <tr key={c.frameId}><td>{c.timestamp.toFixed(2)}</td><td>{c.matched ? 'TARGET_A' : 'unresolved'}</td><td>{c.targetScore.toFixed(2)}</td><td>{c.reach?.toFixed(2) ?? 'unavailable'}</td><td>{c.motion?.toFixed(2) ?? 'unavailable'}</td></tr>)}</tbody></table></details>
+                </>}
+                <div className="text-sm">{phases.map((phase) => <p key={phase}>{phase}: {selectionOrigin[phase]} · {frames.find((f) => f.frameId === selectedFrameByPhase[phase])?.timestampSeconds.toFixed(2) ?? '—'}s</p>)}</div>
+                <button type="button" disabled={autoBusy || !autoResult?.proposals.length} onClick={analyzeAcceptedPhases} className="rounded border border-emerald-500 p-3 disabled:opacity-40">Analyze selected frames for TARGET_A</button>
+              </section>}
+
               <div className="grid gap-6 lg:grid-cols-[1.75fr_1fr]">
                 <div className="space-y-6">
                   {phases.map((phase) => (
@@ -1340,6 +1441,7 @@ export default function PoseTestPage() {
                       <input
                         type="file"
                         accept="image/png,image/jpeg"
+                        disabled={autoBusy}
                         onChange={handleFileChange(phase)}
                         className="mt-4 w-full cursor-pointer rounded-2xl border border-slate-700 bg-slate-900/80 px-4 py-3 text-slate-100 outline-none transition focus:border-emerald-400 focus:ring-2 focus:ring-emerald-500/20"
                       />
@@ -1348,7 +1450,7 @@ export default function PoseTestPage() {
                         <button
                           type="button"
                           onClick={handleDetectPose(phase)}
-                          disabled={!previews[phase] || loading[phase]}
+                          disabled={autoBusy || !previews[phase] || loading[phase]}
                           className="inline-flex items-center justify-center rounded-2xl bg-emerald-500 px-6 py-3 text-base font-semibold text-slate-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-60"
                         >
                           {loading[phase] ? 'Detecting...' : 'Detect Pose'}
@@ -1364,6 +1466,14 @@ export default function PoseTestPage() {
                         <button
                           type="button"
                           onClick={() => {
+                            if (autoBusy) return
+                            if (phase === 'ready') {
+                              sourceGeneration.current += 1
+                              setPersistentAnchor(null)
+                              setAutoResult(null)
+                              autoCache.current.clear()
+                            }
+                            setSelectionOrigin((s) => overridePhase(s, phase, 'MANUAL OVERRIDE'))
                             setSelectedPoseIndex((s) => ({ ...s, [phase]: null }))
                             if (analyses[phase]) drawResults(analyses[phase]!.poses, canvasRefs.current[phase], imageRefs.current[phase], canvasSizes[phase], null)
                           }}
