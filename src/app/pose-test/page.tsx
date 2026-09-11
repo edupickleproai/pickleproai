@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, type ChangeEvent } from 'react'
 import BiomechanicsPanel from './BiomechanicsPanel'
 import type { NormalizedLandmark } from '@mediapipe/tasks-vision'
-import { detectPhases, matchPhaseTarget, overridePhase, phaseGeometry, scorePlayerMatch, type PhaseResult, type PhaseCandidate } from '@/lib/phase-detection'
+import { detectPhases, matchPhaseTarget, overridePhase, phaseGeometry, scorePlayerMatch, planPhaseRefinement, refinePhases, type RefinementResult, type PhaseResult, type PhaseCandidate } from '@/lib/phase-detection'
 import { buildCoachingBiomechanicsPayload, clearStoredVideoBiomechanics, COACHING_BIOMECHANICS_STORAGE_KEY, videoFingerprint } from '@/lib/coaching-biomechanics'
 
 const MODEL_URL =
@@ -379,6 +379,11 @@ export default function PoseTestPage() {
   const [persistentAssignment, setPersistentAssignment] = useState<Record<Phase, { persistentPlayerId?: string; poseIndex?: number; score?: number; manual?: boolean }>>({ ready: {}, contact: {}, recovery: {} } as any)
   const [matchCandidates, setMatchCandidates] = useState<Record<Phase, Array<any>>>({ ready: [], contact: [], recovery: [] } as any)
   const [autoResult, setAutoResult] = useState<PhaseResult | null>(null)
+  const [refinement, setRefinement] = useState<RefinementResult | null>(null)
+  const [localEvidence, setLocalEvidence] = useState<Array<{ phase: Phase; timestamp: number; extracted: boolean; poses: number; sources: string; poseIndex: number | null; score: number; second: number | null; rejection: string | null; geometry: boolean }>>([])
+  const [refinedFrames, setRefinedFrames] = useState<Array<{ frameId: string; timestampSeconds: number; imageDataUrl: string }>>([])
+  const phaseFrames = [...frames, ...refinedFrames]
+  const displayProposals = refinement?.proposals ?? autoResult?.proposals ?? []
   const [autoBusy, setAutoBusy] = useState(false)
   const [paddleHand, setPaddleHand] = useState<'left' | 'right'>('right')
   const [selectionOrigin, setSelectionOrigin] = useState<Record<Phase, string>>({ ready: 'MANUAL', contact: 'MANUAL', recovery: 'MANUAL' })
@@ -391,7 +396,8 @@ export default function PoseTestPage() {
   const [phaseVideoFingerprint, setPhaseVideoFingerprint] = useState<Record<Phase, string | null>>({ ready: null, contact: null, recovery: null })
 
   const resetVideoAnalysis = () => {
-    setAutoResult(null)
+    setRefinedFrames([])
+    setAutoResult(null); setRefinement(null); setLocalEvidence([])
     setAutoBusy(false)
     autoCache.current.clear()
     setSelectionOrigin({ ready: 'MANUAL', contact: 'MANUAL', recovery: 'MANUAL' })
@@ -433,7 +439,7 @@ export default function PoseTestPage() {
   }, [])
 
   const handleFileChange = (phase: Phase) => (event: ChangeEvent<HTMLInputElement>) => {
-    setAutoResult(null)
+    setAutoResult(null); setRefinement(null); setLocalEvidence([])
     autoCache.current.clear()
     sourceGeneration.current += 1
     setPhaseVideoFingerprint((s) => ({ ...s, [phase]: null }))
@@ -559,7 +565,7 @@ export default function PoseTestPage() {
       setProcessingStatus('Ready frame not assigned')
       return
     }
-    const frame = frames.find((f) => f.frameId === fid)
+    const frame = phaseFrames.find((f) => f.frameId === fid)
     if (!frame) {
       setProcessingStatus('Ready frame not found')
       return
@@ -587,7 +593,7 @@ export default function PoseTestPage() {
     for (const phase of ['contact', 'recovery'] as Phase[]) {
       const fid = selectedFrameByPhase[phase]
       if (!fid) continue
-      const frame = frames.find((f) => f.frameId === fid)
+      const frame = phaseFrames.find((f) => f.frameId === fid)
       if (!frame) continue
       const img = new Image()
       img.src = frame.imageDataUrl
@@ -852,7 +858,7 @@ export default function PoseTestPage() {
     if (!persistentAnchor || autoBusy) return
     const generation = ++sourceGeneration.current
     setAutoBusy(true)
-    setAutoResult(null)
+    setAutoResult(null); setRefinement(null); setLocalEvidence([])
     autoCache.current.clear()
     const candidates: PhaseCandidate[] = []
     try {
@@ -882,9 +888,95 @@ export default function PoseTestPage() {
     }
   }
 
+  const runLocalRefinement = async () => {
+    if (!autoResult || !persistentAnchor || !videoUrl || !videoMeta || autoBusy) return
+    const plan = planPhaseRefinement(autoResult.proposals, videoMeta.duration)
+    if (!plan.windows.length) return
+    const generation = ++sourceGeneration.current
+    setAutoBusy(true)
+    setRefinement(null)
+    const video = document.createElement('video')
+    const localFrames: typeof refinedFrames = []
+    const localCandidates: PhaseCandidate[] = []
+    const evidence: typeof localEvidence = plan.windows.flatMap((w) => w.timestamps.map((timestamp) => ({ phase: w.phase, timestamp, extracted: false, poses: 0, sources: '', poseIndex: null, score: 0, second: null, rejection: 'pending / not extracted', geometry: false })))
+    setLocalEvidence(evidence)
+    const recordEvidence = (timestamp: number, frameId: string, candidate?: PhaseCandidate) => {
+      const entry = autoCache.current.get(frameId)
+      const size = entry ? { width: entry.image.naturalWidth, height: entry.image.naturalHeight } : null
+      const match = matchPhaseTarget(persistentAnchor.features, entry && size ? entry.poses.map((pose) => ({ poseIndex: pose.poseIndex, features: extractFeatures(pose, size) })) : [])
+      evidence[evidence.findIndex((e) => e.timestamp === timestamp)] = { phase: plan.windows.find((w) => w.timestamps.includes(timestamp))!.phase, timestamp, extracted: !!entry,
+        poses: entry?.poses.length ?? 0, sources: entry?.poses.map((p) => p.detectionSource).join(', ') ?? '', poseIndex: match.poseIndex,
+        score: match.score, second: match.secondScore, rejection: match.rejection, geometry: candidate?.wrist != null }
+      setLocalEvidence([...evidence])
+    }
+    // Waits clean up their handlers on success/error/timeout; no unbounded seeks.
+    const waitVideo = (event: 'loadeddata' | 'seeked', action: () => void) => new Promise<void>((resolve, reject) => {
+      const cleanup = () => { clearTimeout(timer); video.removeEventListener(event, done); video.removeEventListener('error', failed) }
+      const done = () => { cleanup(); resolve() }
+      const failed = () => { cleanup(); reject(new Error('Local video extraction failed')) }
+      const timer = setTimeout(failed, 8000)
+      video.addEventListener(event, done, { once: true })
+      video.addEventListener('error', failed, { once: true })
+      action()
+    })
+    try {
+      await waitVideo('loadeddata', () => { video.preload = 'auto'; video.src = videoUrl; video.load() })
+      const canvas = document.createElement('canvas')
+      const scale = Math.min(1, 1280 / video.videoWidth)
+      canvas.width = Math.round(video.videoWidth * scale)
+      canvas.height = Math.round(video.videoHeight * scale)
+      const ctx = canvas.getContext('2d')
+      if (!ctx) throw new Error('Canvas unavailable')
+      const timestamps = plan.windows.flatMap((w) => w.timestamps)
+      for (const [i, timestamp] of timestamps.entries()) {
+        if (generation !== sourceGeneration.current) return
+        setProcessingStatus(`Local refinement: ${i + 1}/${timestamps.length}`)
+        const coarseFrame = frames.find((f) => Math.abs(f.timestampSeconds - timestamp) < 0.000001)
+        if (coarseFrame) {
+          const candidate = autoResult.candidates.find((c) => c.frameId === coarseFrame.frameId)
+          if (candidate) localCandidates.push(candidate)
+          recordEvidence(timestamp, coarseFrame.frameId, candidate)
+          continue
+        }
+        const seekTime = Math.min(video.duration - 0.001, Math.max(0, timestamp))
+        if (Math.abs(video.currentTime - seekTime) > 0.000001) await waitVideo('seeked', () => { video.currentTime = seekTime })
+        if (generation !== sourceGeneration.current) return
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+        const frame = { frameId: `local-${Math.round(timestamp * 1000000)}`, timestampSeconds: timestamp, imageDataUrl: canvas.toDataURL('image/jpeg', 0.92) }
+        const image = new Image()
+        image.src = frame.imageDataUrl
+        await image.decode()
+        const size = { width: image.naturalWidth, height: image.naturalHeight }
+        const poses = await detectMultiPass(image, size)
+        if (generation !== sourceGeneration.current) return
+        const match = matchPhaseTarget(persistentAnchor.features, poses.map((pose) => ({ poseIndex: pose.poseIndex, features: extractFeatures(pose, size) })))
+        const target = poses.find((p) => p.poseIndex === match.poseIndex)
+        autoCache.current.set(frame.frameId, { image, poses, poseIndex: match.poseIndex, score: match.score })
+        localFrames.push(frame)
+        localCandidates.push({ frameId: frame.frameId, timestamp, matched: match.reliable, targetScore: match.score,
+          ...(target ? phaseGeometry(target.landmarks, size.width / size.height, paddleHand) : { reach: null, wrist: null }) })
+        recordEvidence(timestamp, frame.frameId, localCandidates[localCandidates.length - 1])
+        await new Promise((resolve) => setTimeout(resolve, 0))
+      }
+      if (generation !== sourceGeneration.current) return
+      setRefinedFrames((previous) => [...previous.filter((f) => !localFrames.some((next) => next.frameId === f.frameId)), ...localFrames])
+      setRefinement(refinePhases(autoResult, localCandidates, plan))
+      setProcessingStatus('Local refinement complete — review timing changes before accepting')
+    } catch {
+      if (generation === sourceGeneration.current) {
+        setRefinement(refinePhases(autoResult, [], plan))
+        setProcessingStatus('Local refinement unavailable; coarse proposals retained')
+      }
+    } finally {
+      video.removeAttribute('src')
+      video.load()
+      if (generation === sourceGeneration.current) setAutoBusy(false)
+    }
+  }
+
   const acceptAutomaticPhases = () => {
-    if (autoResult?.proposals.length !== 3) return
-    setSelectedFrameByPhase(Object.fromEntries(autoResult.proposals.map((p) => [p.phase, p.frameId])) as Record<Phase, string>)
+    if (displayProposals.length !== 3) return
+    setSelectedFrameByPhase(Object.fromEntries(displayProposals.map((p) => [p.phase, p.frameId])) as Record<Phase, string>)
     setSelectionOrigin({ ready: 'AUTO', contact: 'AUTO', recovery: 'AUTO' })
     setAnalyses({ ready: null, contact: null, recovery: null })
     setSelectedPoseIndex({ ready: null, contact: null, recovery: null })
@@ -895,7 +987,7 @@ export default function PoseTestPage() {
   }
 
   const analyzeAcceptedPhases = async () => {
-    const selected = phases.map((phase) => frames.find((f) => f.frameId === selectedFrameByPhase[phase]))
+    const selected = phases.map((phase) => phaseFrames.find((f) => f.frameId === selectedFrameByPhase[phase]))
     if (selected.some((f) => !f) || !(selected[0]!.timestampSeconds < selected[1]!.timestampSeconds && selected[1]!.timestampSeconds < selected[2]!.timestampSeconds)) {
       setProcessingStatus('Select three distinct frames in Ready → Contact → Recovery order first.')
       return
@@ -1159,7 +1251,7 @@ export default function PoseTestPage() {
         if (phase === 'ready') {
           const features = extractFeatures(pose, canvasSizes[phase])
           sourceGeneration.current += 1
-          setAutoResult(null)
+          setAutoResult(null); setRefinement(null); setLocalEvidence([])
           setAutoBusy(false)
           autoCache.current.clear()
           setPersistentAnchor({ id: 'TARGET_A', features })
@@ -1386,9 +1478,9 @@ export default function PoseTestPage() {
                     </div>
 
                     <div className="mt-4 text-sm text-slate-200">
-                      <div>Ready Position: {selectedFrameByPhase.ready ? `${(frames.find(f=>f.frameId===selectedFrameByPhase.ready)?.timestampSeconds ?? 0).toFixed(2)}s` : '—'}</div>
-                      <div>Contact Point: {selectedFrameByPhase.contact ? `${(frames.find(f=>f.frameId===selectedFrameByPhase.contact)?.timestampSeconds ?? 0).toFixed(2)}s` : '—'}</div>
-                      <div>Recovery Step: {selectedFrameByPhase.recovery ? `${(frames.find(f=>f.frameId===selectedFrameByPhase.recovery)?.timestampSeconds ?? 0).toFixed(2)}s` : '—'}</div>
+                      <div>Ready Position: {selectedFrameByPhase.ready ? `${(phaseFrames.find(f=>f.frameId===selectedFrameByPhase.ready)?.timestampSeconds ?? 0).toFixed(2)}s` : '—'}</div>
+                      <div>Contact Point: {selectedFrameByPhase.contact ? `${(phaseFrames.find(f=>f.frameId===selectedFrameByPhase.contact)?.timestampSeconds ?? 0).toFixed(2)}s` : '—'}</div>
+                      <div>Recovery Step: {selectedFrameByPhase.recovery ? `${(phaseFrames.find(f=>f.frameId===selectedFrameByPhase.recovery)?.timestampSeconds ?? 0).toFixed(2)}s` : '—'}</div>
                     </div>
 
                     <div className="mt-4 flex items-center gap-3">
@@ -1408,13 +1500,26 @@ export default function PoseTestPage() {
               {frames.length > 0 && <section className="rounded-3xl border border-slate-700 bg-slate-950 p-6 space-y-3">
                 <h2 className="text-xl font-semibold">Automatic Phase Detection</h2>
                 <p className="text-sm text-slate-300">Assign one clear frame to Ready, analyze it, and click the physical player once to identify TARGET_A. Then scan the video. Manual assignment remains available.</p>
-                <label className="block">Paddle hand <select aria-label="Paddle hand" value={paddleHand} disabled={autoBusy} onChange={(e) => { setPaddleHand(e.target.value as 'left' | 'right'); setAutoResult(null); autoCache.current.clear() }} className="bg-slate-800 p-2"><option value="right">Right</option><option value="left">Left</option></select></label>
+                <label className="block">Paddle hand <select aria-label="Paddle hand" value={paddleHand} disabled={autoBusy} onChange={(e) => { setPaddleHand(e.target.value as 'left' | 'right'); setAutoResult(null); setRefinement(null); setLocalEvidence([]); autoCache.current.clear() }} className="bg-slate-800 p-2"><option value="right">Right</option><option value="left">Left</option></select></label>
                 <button type="button" disabled={!persistentAnchor || autoBusy || extracting || phases.some((p) => loading[p])} onClick={runAutomaticPhases} className="rounded bg-emerald-600 p-3 disabled:opacity-40">{autoBusy ? 'Scanning / analyzing…' : 'Propose automatic phases'}</button>
                 {autoResult && <>
+                  <button type="button" disabled={autoBusy || autoResult.proposals.length !== 3} onClick={runLocalRefinement} className="rounded border border-emerald-500 p-3 disabled:opacity-40">Refine local phase timing</button>
+                  {!!localEvidence.length && <details open><summary>Local refinement evidence</summary>
+                    <table className="text-xs mb-3"><thead><tr><th>Phase</th><th>Requested</th><th>Extracted / reused</th><th>Pose detected</th><th>Multiple poses</th><th>TARGET_A matched</th><th>Ambiguous</th><th>Low score</th><th>Other rejected / pending</th></tr></thead><tbody>{phases.map((phase) => {
+                      const rows = localEvidence.filter((e) => e.phase === phase)
+                      return <tr key={phase}><td>{phase}</td><td>{rows.length}</td><td>{rows.filter((e) => e.extracted).length}</td><td>{rows.filter((e) => e.poses > 0).length}</td><td>{rows.filter((e) => e.poses > 1).length}</td><td>{rows.filter((e) => e.poseIndex !== null).length}</td><td>{rows.filter((e) => e.rejection === 'ambiguous').length}</td><td>{rows.filter((e) => e.rejection === 'low score').length}</td><td>{rows.filter((e) => e.rejection && !['ambiguous', 'low score'].includes(e.rejection)).length}</td></tr>
+                    })}</tbody></table>
+                    <table className="text-xs"><thead><tr><th>Phase / time</th><th>Extracted</th><th>Poses / sources</th><th>TARGET_A index</th><th>Best / second</th><th>Rejection</th><th>Arm geometry</th></tr></thead>
+                      <tbody>{localEvidence.map((e) => <tr key={`${e.phase}-${e.timestamp}`}><td>{e.phase} {e.timestamp.toFixed(3)}</td><td>{String(e.extracted)}</td><td>{e.poses} / {e.sources}</td><td>{e.poseIndex ?? '—'}</td><td>{e.score.toFixed(3)} / {e.second?.toFixed(3) ?? '—'}</td><td>{e.rejection ?? 'matched'}</td><td>{String(e.geometry)}</td></tr>)}</tbody></table>
+                  </details>}
+                  {refinement?.comparison && <details open><summary>Dense baseline versus local challenger</summary><div className="grid grid-cols-3 gap-3">{refinement.comparison.map((c) => <div key={c.phase} className="text-xs">
+                    <p>{c.phase}: {c.validCandidates} scored candidates · coarse {c.coarseScore.toFixed(3)} / challenger {c.challengerScore.toFixed(3)} at {c.challengerTimestamp.toFixed(3)}s</p>
+                    <img alt={`Local challenger ${c.phase}`} src={phaseFrames.find((f) => f.frameId === c.challengerFrameId)?.imageDataUrl} />
+                  </div>)}</div></details>}
                   {autoResult.reasons.map((reason) => <p key={reason} className="text-sm text-amber-200">{reason}</p>)}
                   {!autoResult.proposals.length && <p>Unresolved — keep manual selection.</p>}
-                  <div className="grid gap-4 md:grid-cols-3">{autoResult.proposals.map((proposal) => {
-                    const frame = frames.find((f) => f.frameId === proposal.frameId)!
+                  <div className="grid gap-4 md:grid-cols-3">{displayProposals.map((proposal) => {
+                    const frame = phaseFrames.find((f) => f.frameId === proposal.frameId)!
                     const entry = autoCache.current.get(proposal.frameId)
                     const target = entry?.poses.find((p) => p.poseIndex === entry.poseIndex)
                     return <article key={proposal.phase} className="border border-slate-600 p-3" aria-label={`Automatic ${proposal.phase}`}>
@@ -1423,14 +1528,18 @@ export default function PoseTestPage() {
                         {target && entry && <div className="absolute border-2 border-emerald-400 pointer-events-none" style={{ left: `${100 * target.bbox.left / entry.image.naturalWidth}%`, top: `${100 * target.bbox.top / entry.image.naturalHeight}%`, width: `${100 * target.bbox.width / entry.image.naturalWidth}%`, height: `${100 * target.bbox.height / entry.image.naturalHeight}%` }}><span className="bg-slate-950 text-xs text-emerald-300">TARGET_A</span></div>}
                       </div>
                       <p>Confidence: {proposal.confidence} · Score: {proposal.score.toFixed(2)}</p>
+                      {refinement?.details.filter((d) => d.phase === proposal.phase).map((d) => <div key={d.phase} className="text-sm text-amber-200">
+                        <p>Coarse: {d.coarseTimestamp.toFixed(2)}s · Refined: {d.refinedTimestamp.toFixed(2)}s · Adjustment: {d.adjustment >= 0 ? '+' : ''}{d.adjustment.toFixed(2)}s</p>
+                        <p>{d.accepted ? 'Refined' : 'Coarse retained'}: {d.reason}</p>
+                      </div>)}
                       <ul className="list-disc pl-4 text-sm">{proposal.reasons.map((r) => <li key={r}>{r}</li>)}</ul>
                     </article>
                   })}</div>
-                  {autoResult.proposals.length === 3 && <button disabled={autoBusy} type="button" onClick={acceptAutomaticPhases} className="rounded bg-emerald-600 p-3">Accept proposals after visual review</button>}
+                  {displayProposals.length === 3 && <button disabled={autoBusy} type="button" onClick={acceptAutomaticPhases} className="rounded bg-emerald-600 p-3">Accept proposals after visual review</button>}
                   <details><summary>Candidate evidence (development)</summary><table className="text-xs"><thead><tr><th>Time</th><th>Target matched</th><th>Match score</th><th>Arm reach / torso</th><th>Local motion</th></tr></thead><tbody>{autoResult.candidates.map((c) => <tr key={c.frameId}><td>{c.timestamp.toFixed(2)}</td><td>{c.matched ? 'TARGET_A' : 'unresolved'}</td><td>{c.targetScore.toFixed(2)}</td><td>{c.reach?.toFixed(2) ?? 'unavailable'}</td><td>{c.motion?.toFixed(2) ?? 'unavailable'}</td></tr>)}</tbody></table></details>
                 </>}
-                <div className="text-sm">{phases.map((phase) => <p key={phase}>{phase}: {selectionOrigin[phase]} · {frames.find((f) => f.frameId === selectedFrameByPhase[phase])?.timestampSeconds.toFixed(2) ?? '—'}s</p>)}</div>
-                <button type="button" disabled={autoBusy || !autoResult?.proposals.length} onClick={analyzeAcceptedPhases} className="rounded border border-emerald-500 p-3 disabled:opacity-40">Analyze selected frames for TARGET_A</button>
+                <div className="text-sm">{phases.map((phase) => <p key={phase}>{phase}: {selectionOrigin[phase]} · {phaseFrames.find((f) => f.frameId === selectedFrameByPhase[phase])?.timestampSeconds.toFixed(2) ?? '—'}s</p>)}</div>
+                <button type="button" disabled={autoBusy || !displayProposals.length} onClick={analyzeAcceptedPhases} className="rounded border border-emerald-500 p-3 disabled:opacity-40">Analyze selected frames for TARGET_A</button>
               </section>}
 
               <div className="grid gap-6 lg:grid-cols-[1.75fr_1fr]">
@@ -1470,7 +1579,7 @@ export default function PoseTestPage() {
                             if (phase === 'ready') {
                               sourceGeneration.current += 1
                               setPersistentAnchor(null)
-                              setAutoResult(null)
+                              setAutoResult(null); setRefinement(null); setLocalEvidence([])
                               autoCache.current.clear()
                             }
                             setSelectionOrigin((s) => overridePhase(s, phase, 'MANUAL OVERRIDE'))
