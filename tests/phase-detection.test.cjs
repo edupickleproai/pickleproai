@@ -8,6 +8,55 @@ const filename = path.resolve(__dirname, '../src/lib/phase-detection.ts')
 const mod = new Module(filename, module)
 mod._compile(ts.transpileModule(fs.readFileSync(filename, 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText, filename)
 const { detectPhases, matchPhaseTarget, phaseGeometry, overridePhase, scorePlayerMatch, planPhaseRefinement, refinePhases, selectMixedPhases } = mod.exports
+const { planCoarseSampling } = mod.exports
+for (const [duration, count] of [[15.77, 29], [21.20, 39], [24.20, 44], [34.60, 63], [38.15, 70]]) {
+  test(`adaptive sampling supplies local motion for ${duration}s`, () => {
+    const plan = planCoarseSampling(duration)
+    assert.equal(plan.frameCount, count)
+    assert.equal(plan.motionCompatible, true)
+    assert.ok(plan.interval <= 0.55 && plan.interval < 0.8)
+    const result = detectPhases(plan.timestamps.map((timestamp, i) => ({
+      frameId: `f${i}`, timestamp, targetScore: 1, matched: true,
+      reach: 1, wrist: { x: i % 3, y: 0 },
+    })))
+    assert.ok(result.candidates.every((c) => c.motion !== null))
+  })
+}
+test('short clips use only four samples, ordered uniquely inside the video', () => {
+  const plan = planCoarseSampling(1)
+  assert.equal(plan.frameCount, 4)
+  assert.deepEqual(plan.timestamps, [0.125, 0.375, 0.625, 0.875])
+})
+test('sampling scales deterministically with duration', () => {
+  const durations = [1, 5, 15, 30, 60]
+  const counts = durations.map((d) => planCoarseSampling(d).frameCount)
+  assert.deepEqual(counts, [4, 10, 28, 55, 110])
+  for (const d of durations) assert.deepEqual(planCoarseSampling(d), planCoarseSampling(d))
+})
+test('cap bounds work while reporting compatible capped coverage honestly', () => {
+  const plan = planCoarseSampling(80)
+  assert.equal(plan.frameCount, 120)
+  assert.equal(plan.timestamps.length, 120)
+  assert.equal(plan.capped, true)
+  assert.equal(plan.motionCompatible, true)
+})
+test('cap exceeding motion limit explicitly reports insufficient coverage', () => {
+  for (const duration of [96, 120, 3600]) {
+    const plan = planCoarseSampling(duration)
+    assert.equal(plan.frameCount, 120)
+    assert.equal(plan.motionCompatible, false)
+    assert.match(plan.reason, /Insufficient sampling coverage/)
+    assert.match(plan.reason, /unresolved/)
+  }
+})
+test('invalid duration fails closed without allocating frames', () => {
+  for (const duration of [0, -1, NaN, Infinity]) {
+    const plan = planCoarseSampling(duration)
+    assert.equal(plan.frameCount, 0)
+    assert.equal(plan.motionCompatible, false)
+    assert.deepEqual(plan.timestamps, [])
+  }
+})
 const clip = () => [0.4, 0.4, 0.7, 1.5, 0.7, 0.4, 0.4].map((reach, i) => ({ frameId: `f${i}`, timestamp: i * 0.2, targetScore: 0.98, matched: true, reach, wrist: { x: reach, y: 0 } }))
 const player = (x) => ({ center: { x, y: 0.5 }, area: 0.08, landmarks: Array.from({ length: 33 }, () => ({ x, y: 0.5, visibility: 0.95 })) })
 

@@ -1,4 +1,25 @@
 export type Phase = 'ready' | 'contact' | 'recovery'
+// Bound browser JPEG storage and sequential multi-pass inference to 120 frames.
+// Midpoint sampling covers the whole clip; long-form segmentation is out of scope.
+export function planCoarseSampling(duration: number) {
+  const targetInterval = 0.55
+  const minFrames = 4
+  const maxFrames = 120
+  if (!Number.isFinite(duration) || duration <= 0) return {
+    frameCount: 0, interval: 0, timestamps: [] as number[], capped: false,
+    motionCompatible: false, reason: 'Insufficient sampling coverage: invalid video duration.',
+  }
+  const requested = Math.max(minFrames, Math.ceil(duration / targetInterval))
+  const frameCount = Math.min(maxFrames, requested)
+  const interval = duration / frameCount
+  // Stay strictly inside the detector's unchanged 0.8s neighbor limit.
+  const motionCompatible = interval < 0.8
+  return { frameCount, interval, capped: requested > maxFrames, motionCompatible,
+    timestamps: Array.from({ length: frameCount }, (_, i) => (i + 0.5) * interval),
+    reason: motionCompatible ? null : 'Insufficient sampling coverage: the 120-frame cap cannot keep spacing below 0.8s. Automatic phases are unresolved; manual selection remains available.',
+  }
+}
+
 export type Landmark = { x: number; y: number; visibility?: number }
 export type PlayerFeatures = { center: { x: number; y: number }; area: number; landmarks: Landmark[] }
 

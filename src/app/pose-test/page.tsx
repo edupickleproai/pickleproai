@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, type ChangeEvent } from 'react'
 import BiomechanicsPanel from './BiomechanicsPanel'
 import type { NormalizedLandmark } from '@mediapipe/tasks-vision'
-import { detectPhases, matchPhaseTarget, overridePhase, phaseGeometry, scorePlayerMatch, planPhaseRefinement, refinePhases, type RefinementResult, type PhaseResult, type PhaseCandidate } from '@/lib/phase-detection'
+import { planCoarseSampling, detectPhases, matchPhaseTarget, overridePhase, phaseGeometry, scorePlayerMatch, planPhaseRefinement, refinePhases, type RefinementResult, type PhaseResult, type PhaseCandidate } from '@/lib/phase-detection'
 import { buildCoachingBiomechanicsPayload, clearStoredVideoBiomechanics, COACHING_BIOMECHANICS_STORAGE_KEY, videoFingerprint } from '@/lib/coaching-biomechanics'
 
 const MODEL_URL =
@@ -367,6 +367,7 @@ export default function PoseTestPage() {
   const [videoFile, setVideoFile] = useState<File | null>(null)
   const [videoUrl, setVideoUrl] = useState<string | null>(null)
   const [videoMeta, setVideoMeta] = useState<{ duration: number; width: number; height: number } | null>(null)
+  const samplingPlan = videoMeta ? planCoarseSampling(videoMeta.duration) : null
   const [frames, setFrames] = useState<Array<{ frameId: string; timestampSeconds: number; imageDataUrl: string }>>([])
   const [extracting, setExtracting] = useState(false)
   const [selectedPhaseToAssign, setSelectedPhaseToAssign] = useState<Phase>('ready')
@@ -496,13 +497,8 @@ export default function PoseTestPage() {
       if (generation !== sourceGeneration.current) return
       setVideoMeta({ duration, width: vidW, height: vidH })
 
-      // sample target frames ~20-30 depending on duration
-      const target = Math.min(30, Math.max(8, Math.round(duration * 3)))
-      const sampleCount = Math.max(4, target)
-      const timestamps: number[] = []
-      for (let i = 0; i < sampleCount; i++) {
-        timestamps.push((i + 0.5) * (duration / sampleCount))
-      }
+      const { timestamps } = planCoarseSampling(duration)
+      if (!timestamps.length) throw new Error('Invalid video duration')
 
       const off = document.createElement('canvas')
       const ctx = off.getContext('2d')
@@ -860,6 +856,13 @@ export default function PoseTestPage() {
     setAutoBusy(true)
     setAutoResult(null); setRefinement(null); setLocalEvidence([])
     autoCache.current.clear()
+    if (!samplingPlan?.motionCompatible) {
+      const reason = samplingPlan?.reason ?? 'Insufficient sampling coverage: extract video frames first.'
+      setAutoResult({ proposals: [], candidates: [], reasons: [reason] })
+      setProcessingStatus(reason)
+      setAutoBusy(false)
+      return
+    }
     const candidates: PhaseCandidate[] = []
     try {
       for (const [index, frame] of frames.entries()) {
@@ -1443,6 +1446,7 @@ export default function PoseTestPage() {
                   </div>
                   <div className="space-y-2">
                     <div className="text-sm text-slate-300">{videoMeta ? `Duration: ${videoMeta.duration.toFixed(2)}s • ${videoMeta.width}x${videoMeta.height}` : (videoFile ? videoFile.name : 'Video file not selected')}</div>
+                    {samplingPlan && <div className="text-sm text-slate-300">Adaptive sampling: {samplingPlan.frameCount} planned frames · ~{samplingPlan.interval.toFixed(3)}s interval · Motion-compatible cadence: {samplingPlan.motionCompatible ? 'yes' : 'no'}{samplingPlan.capped ? ' · 120-frame cap reached' : ''}{samplingPlan.reason && <p className="text-amber-300">{samplingPlan.reason}</p>}</div>}
                     <div className="flex gap-2">
                       <label className="inline-flex items-center justify-center rounded-2xl bg-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 cursor-pointer">
                         <input type="file" accept="video/*" onChange={handleVideoChange} className="hidden" />
