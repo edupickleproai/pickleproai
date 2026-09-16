@@ -2,8 +2,9 @@
 
 import { useEffect, useRef, useState, type ChangeEvent } from 'react'
 import BiomechanicsPanel from './BiomechanicsPanel'
+import { trackIdentity, refineIdentity, identitySequenceAllowed, type IdentityEvidence, type IdentityObservation } from '@/lib/phase-detection'
 import type { NormalizedLandmark } from '@mediapipe/tasks-vision'
-import { planCoarseSampling, detectPhases, matchPhaseTarget, overridePhase, phaseGeometry, scorePlayerMatch, planPhaseRefinement, refinePhases, type RefinementResult, type PhaseResult, type PhaseCandidate } from '@/lib/phase-detection'
+import { planCoarseSampling, detectPhases, overridePhase, phaseGeometry, planPhaseRefinement, refinePhases, type RefinementResult, type PhaseResult, type PhaseCandidate } from '@/lib/phase-detection'
 import { buildCoachingBiomechanicsPayload, clearStoredVideoBiomechanics, COACHING_BIOMECHANICS_STORAGE_KEY, videoFingerprint } from '@/lib/coaching-biomechanics'
 
 const MODEL_URL =
@@ -376,7 +377,7 @@ export default function PoseTestPage() {
   const [lastFrameMeta, setLastFrameMeta] = useState<Record<Phase, { timestampSeconds: number; width: number; height: number } | null>>({ ready: null, contact: null, recovery: null })
 
   // Persistent targeting state
-  const [persistentAnchor, setPersistentAnchor] = useState<null | { id: string; features: any }>(null)
+  const [persistentAnchor, setPersistentAnchor] = useState<null | { id: string; features: any; timestamp?: number; poseIndex: number; pose: PoseResult }>(null)
   const [persistentAssignment, setPersistentAssignment] = useState<Record<Phase, { persistentPlayerId?: string; poseIndex?: number; score?: number; manual?: boolean }>>({ ready: {}, contact: {}, recovery: {} } as any)
   const [matchCandidates, setMatchCandidates] = useState<Record<Phase, Array<any>>>({ ready: [], contact: [], recovery: [] } as any)
   const [autoResult, setAutoResult] = useState<PhaseResult | null>(null)
@@ -388,7 +389,7 @@ export default function PoseTestPage() {
   const [autoBusy, setAutoBusy] = useState(false)
   const [paddleHand, setPaddleHand] = useState<'left' | 'right'>('right')
   const [selectionOrigin, setSelectionOrigin] = useState<Record<Phase, string>>({ ready: 'MANUAL', contact: 'MANUAL', recovery: 'MANUAL' })
-  const autoCache = useRef(new Map<string, { image: HTMLImageElement; poses: PoseResult[]; poseIndex: number | null; score: number }>())
+  const autoCache = useRef(new Map<string, { image: HTMLImageElement; poses: PoseResult[]; poseIndex: number | null; score: number; identity?: IdentityEvidence }>())
 
   const imageRefs = useRef<Record<Phase, HTMLImageElement | null>>({} as any)
   const canvasRefs = useRef<Record<Phase, HTMLCanvasElement | null>>({} as any)
@@ -856,6 +857,9 @@ export default function PoseTestPage() {
     setAutoBusy(true)
     setAutoResult(null); setRefinement(null); setLocalEvidence([])
     autoCache.current.clear()
+    setAnalyses({ ready: null, contact: null, recovery: null })
+    setSelectedPoseIndex({ ready: null, contact: null, recovery: null })
+    clearStoredVideoBiomechanics(() => window.localStorage, videoFile ? videoFingerprint(videoFile) : null)
     if (!samplingPlan?.motionCompatible) {
       const reason = samplingPlan?.reason ?? 'Insufficient sampling coverage: extract video frames first.'
       setAutoResult({ proposals: [], candidates: [], reasons: [reason] })
@@ -872,17 +876,34 @@ export default function PoseTestPage() {
         image.src = frame.imageDataUrl
         await image.decode()
         const size = { width: image.naturalWidth, height: image.naturalHeight }
-        const poses = await detectMultiPass(image, size)
+        const poses = Math.abs(frame.timestampSeconds - (persistentAnchor.timestamp ?? -1)) < 0.000001 ? [persistentAnchor.pose] : await detectMultiPass(image, size)
         if (generation !== sourceGeneration.current) return
-        const match = matchPhaseTarget(persistentAnchor.features, poses.map((pose) => ({ poseIndex: pose.poseIndex, features: extractFeatures(pose, size) })))
-        const target = poses.find((p) => p.poseIndex === match.poseIndex)
-        autoCache.current.set(frame.frameId, { image, poses, poseIndex: match.poseIndex, score: match.score })
-        candidates.push({ frameId: frame.frameId, timestamp: frame.timestampSeconds, targetScore: match.score, matched: match.reliable,
-          ...(target ? phaseGeometry(target.landmarks, size.width / size.height, paddleHand) : { reach: null, wrist: null }) })
+        autoCache.current.set(frame.frameId, { image, poses, poseIndex: null, score: 0 })
         await new Promise((resolve) => setTimeout(resolve, 0))
       }
       if (generation !== sourceGeneration.current) return
-      setAutoResult(detectPhases(candidates))
+      const anchorTime = persistentAnchor.timestamp
+      if (anchorTime == null) throw new Error('Select a video-frame identity anchor first')
+      const observations = frames.map((f) => {
+        const entry = autoCache.current.get(f.frameId)!
+        return { frameId: f.frameId, timestamp: f.timestampSeconds, candidates: entry.poses.map((pose) => ({ poseIndex: pose.poseIndex, features: extractFeatures(pose, { width: entry.image.naturalWidth, height: entry.image.naturalHeight }) })) }
+      })
+      const identities = trackIdentity({ timestamp: anchorTime, features: persistentAnchor.features }, observations, videoMeta!.width / videoMeta!.height)
+      for (const frame of frames) {
+        const entry = autoCache.current.get(frame.frameId)!
+        const identity: IdentityEvidence = Math.abs(frame.timestampSeconds - anchorTime) < 0.000001
+          ? { accepted: true, poseIndex: persistentAnchor.poseIndex, score: 1, reason: 'User-selected physical player anchor', observation: { timestamp: anchorTime, features: persistentAnchor.features } }
+          : identities.get(frame.frameId)!
+        entry.identity = identity
+        entry.poseIndex = identity.poseIndex
+        entry.score = identity.score
+        const target = entry.poses.find((p) => p.poseIndex === identity.poseIndex)
+        candidates.push({ frameId: frame.frameId, timestamp: frame.timestampSeconds, targetScore: identity.score, matched: identity.accepted,
+          ...(target ? phaseGeometry(target.landmarks, entry.image.naturalWidth / entry.image.naturalHeight, paddleHand) : { reach: null, wrist: null }) })
+      }
+      const result = detectPhases(candidates)
+      if (!result.proposals.length && candidates.some((c) => !c.matched)) result.reasons.unshift('UNRESOLVED — TARGET IDENTITY: insufficient continuous identity evidence may limit phase selection.')
+      setAutoResult(result)
       setProcessingStatus('Automatic proposals ready for visual review')
     } catch {
       if (generation === sourceGeneration.current) setProcessingStatus('Automatic detection failed. Manual selection remains available.')
@@ -901,15 +922,18 @@ export default function PoseTestPage() {
     const video = document.createElement('video')
     const localFrames: typeof refinedFrames = []
     const localCandidates: PhaseCandidate[] = []
+    const identityReferences: IdentityObservation[] = frames.flatMap((f) => {
+      const e = autoCache.current.get(f.frameId)?.identity
+      return e?.accepted && e.observation ? [e.observation] : []
+    })
     const evidence: typeof localEvidence = plan.windows.flatMap((w) => w.timestamps.map((timestamp) => ({ phase: w.phase, timestamp, extracted: false, poses: 0, sources: '', poseIndex: null, score: 0, second: null, rejection: 'pending / not extracted', geometry: false })))
     setLocalEvidence(evidence)
     const recordEvidence = (timestamp: number, frameId: string, candidate?: PhaseCandidate) => {
       const entry = autoCache.current.get(frameId)
-      const size = entry ? { width: entry.image.naturalWidth, height: entry.image.naturalHeight } : null
-      const match = matchPhaseTarget(persistentAnchor.features, entry && size ? entry.poses.map((pose) => ({ poseIndex: pose.poseIndex, features: extractFeatures(pose, size) })) : [])
+      const identity = entry?.identity
       evidence[evidence.findIndex((e) => e.timestamp === timestamp)] = { phase: plan.windows.find((w) => w.timestamps.includes(timestamp))!.phase, timestamp, extracted: !!entry,
-        poses: entry?.poses.length ?? 0, sources: entry?.poses.map((p) => p.detectionSource).join(', ') ?? '', poseIndex: match.poseIndex,
-        score: match.score, second: match.secondScore, rejection: match.rejection, geometry: candidate?.wrist != null }
+        poses: entry?.poses.length ?? 0, sources: entry?.poses.map((p) => p.detectionSource).join(', ') ?? '', poseIndex: identity?.poseIndex ?? null,
+        score: identity?.score ?? 0, second: null, rejection: identity?.accepted ? null : identity?.reason ?? 'Missing identity evidence', geometry: candidate?.wrist != null }
       setLocalEvidence([...evidence])
     }
     // Waits clean up their handlers on success/error/timeout; no unbounded seeks.
@@ -952,11 +976,11 @@ export default function PoseTestPage() {
         const size = { width: image.naturalWidth, height: image.naturalHeight }
         const poses = await detectMultiPass(image, size)
         if (generation !== sourceGeneration.current) return
-        const match = matchPhaseTarget(persistentAnchor.features, poses.map((pose) => ({ poseIndex: pose.poseIndex, features: extractFeatures(pose, size) })))
-        const target = poses.find((p) => p.poseIndex === match.poseIndex)
-        autoCache.current.set(frame.frameId, { image, poses, poseIndex: match.poseIndex, score: match.score })
+        const identity = refineIdentity(identityReferences, timestamp, poses.map((pose) => ({ poseIndex: pose.poseIndex, features: extractFeatures(pose, size) })), size.width / size.height)
+        const target = poses.find((p) => p.poseIndex === identity.poseIndex)
+        autoCache.current.set(frame.frameId, { image, poses, poseIndex: identity.poseIndex, score: identity.score, identity })
         localFrames.push(frame)
-        localCandidates.push({ frameId: frame.frameId, timestamp, matched: match.reliable, targetScore: match.score,
+        localCandidates.push({ frameId: frame.frameId, timestamp, matched: identity.accepted, targetScore: identity.score,
           ...(target ? phaseGeometry(target.landmarks, size.width / size.height, paddleHand) : { reach: null, wrist: null }) })
         recordEvidence(timestamp, frame.frameId, localCandidates[localCandidates.length - 1])
         await new Promise((resolve) => setTimeout(resolve, 0))
@@ -978,7 +1002,10 @@ export default function PoseTestPage() {
   }
 
   const acceptAutomaticPhases = () => {
-    if (displayProposals.length !== 3) return
+    if (!identitySequenceAllowed(displayProposals.map((p) => p.frameId), (id) => autoCache.current.get(id)?.identity)) {
+      setProcessingStatus('UNRESOLVED — TARGET IDENTITY: automatic phase acceptance blocked.')
+      return
+    }
     setSelectedFrameByPhase(Object.fromEntries(displayProposals.map((p) => [p.phase, p.frameId])) as Record<Phase, string>)
     setSelectionOrigin({ ready: 'AUTO', contact: 'AUTO', recovery: 'AUTO' })
     setAnalyses({ ready: null, contact: null, recovery: null })
@@ -995,8 +1022,8 @@ export default function PoseTestPage() {
       setProcessingStatus('Select three distinct frames in Ready → Contact → Recovery order first.')
       return
     }
-    if (selected.some((f) => autoCache.current.get(f!.frameId)?.poseIndex == null)) {
-      setProcessingStatus('TARGET_A is unresolved in a selected frame. Use the manual analysis and player-selection fallback.')
+    if (!identitySequenceAllowed(selected.map((f) => f!.frameId), (id) => autoCache.current.get(id)?.identity)) {
+      setProcessingStatus('UNRESOLVED — TARGET IDENTITY: biomechanics blocked. Use explicit manual player selection.')
       return
     }
     const generation = sourceGeneration.current
@@ -1018,8 +1045,6 @@ export default function PoseTestPage() {
       if (generation === sourceGeneration.current) setAutoBusy(false)
     }
   }
-
-  const scoreMatch = scorePlayerMatch
 
   const handleDetectPose = (phase: Phase, automatic?: { image: HTMLImageElement; poses: PoseResult[]; poseIndex: number; score: number }) => async () => {
     const generation = sourceGeneration.current
@@ -1185,25 +1210,11 @@ export default function PoseTestPage() {
         setSelectedPoseIndex((s) => ({ ...s, [phase]: automatic.poseIndex }))
         setPersistentAssignment((s) => ({ ...s, [phase]: { persistentPlayerId: 'TARGET_A', poseIndex: automatic.poseIndex, score: automatic.score, manual: false } }))
       } else if (persistentAnchor && phase !== 'ready') {
-        const anchor = persistentAnchor.features
-        const size = canvasSizes[phase]
-        const candidates = poseResults.map((p) => ({ pose: p, features: extractFeatures(p, size) }))
-        const scored = candidates.map((c) => ({ poseIndex: c.pose.poseIndex, ...scoreMatch(anchor, c.features) }))
-        setMatchCandidates((m) => ({ ...m, [phase]: scored }))
-
-        // choose best
-        const best = scored.reduce((bestSoFar, cur) => (cur.overall > (bestSoFar?.overall ?? -1) ? cur : bestSoFar), null as any)
-        const MATCH_THRESHOLD = 0.6
-        if (best && best.overall >= MATCH_THRESHOLD) {
-          // assign match
-          setSelectedPoseIndex((s) => ({ ...s, [phase]: best.poseIndex }))
-          setPersistentAssignment((pa) => ({ ...pa, [phase]: { persistentPlayerId: persistentAnchor.id, poseIndex: best.poseIndex, score: best.overall, manual: false } }))
-          drawResults(poseResults, canvasRefs.current[phase], imageRefs.current[phase], canvasSizes[phase], best.poseIndex)
-        } else {
-          // no confident match
-          setPersistentAssignment((pa) => ({ ...pa, [phase]: { persistentPlayerId: persistentAnchor.id, poseIndex: undefined, score: best?.overall ?? 0, manual: false } }))
-          drawResults(poseResults, canvasRefs.current[phase], imageRefs.current[phase], canvasSizes[phase], null)
-        }
+        // Independent image analysis has no temporal identity proof. Require an
+        // explicit human selection instead of the old best-at-anchor substitution.
+        setSelectedPoseIndex((s) => ({ ...s, [phase]: null }))
+        setPersistentAssignment((s) => ({ ...s, [phase]: { persistentPlayerId: 'TARGET_A', manual: false } }))
+        drawResults(poseResults, canvasRefs.current[phase], imageRefs.current[phase], canvasSizes[phase], null)
       } else {
         drawResults(poseResults, canvasRefs.current[phase], imageRefs.current[phase], canvasSizes[phase], selectedPoseIndex[phase])
       }
@@ -1257,7 +1268,7 @@ export default function PoseTestPage() {
           setAutoResult(null); setRefinement(null); setLocalEvidence([])
           setAutoBusy(false)
           autoCache.current.clear()
-          setPersistentAnchor({ id: 'TARGET_A', features })
+          setPersistentAnchor({ id: 'TARGET_A', features, timestamp: lastFrameMeta.ready?.timestampSeconds, poseIndex: pose.poseIndex, pose })
           setPersistentAssignment((pa) => ({ ...pa, ready: { persistentPlayerId: 'TARGET_A', poseIndex: pose.poseIndex, score: 1, manual: true } }))
         }
         drawResults(analysis.poses, canvasRefs.current[phase], imageRefs.current[phase], canvasSizes[phase], pose.poseIndex)
@@ -1531,7 +1542,7 @@ export default function PoseTestPage() {
                       <div className="relative"><img src={frame.imageDataUrl} alt={`Automatic ${proposal.phase} at ${proposal.timestamp.toFixed(2)} seconds`} />
                         {target && entry && <div className="absolute border-2 border-emerald-400 pointer-events-none" style={{ left: `${100 * target.bbox.left / entry.image.naturalWidth}%`, top: `${100 * target.bbox.top / entry.image.naturalHeight}%`, width: `${100 * target.bbox.width / entry.image.naturalWidth}%`, height: `${100 * target.bbox.height / entry.image.naturalHeight}%` }}><span className="bg-slate-950 text-xs text-emerald-300">TARGET_A</span></div>}
                       </div>
-                      <p>Confidence: {proposal.confidence} · Score: {proposal.score.toFixed(2)}</p>
+                      <p>Identity: {entry?.identity?.accepted ? 'continuity supported' : 'unresolved'} · {entry?.identity?.reason}</p><p>Confidence: {proposal.confidence} · Score: {proposal.score.toFixed(2)}</p>
                       {refinement?.details.filter((d) => d.phase === proposal.phase).map((d) => <div key={d.phase} className="text-sm text-amber-200">
                         <p>Coarse: {d.coarseTimestamp.toFixed(2)}s · Refined: {d.refinedTimestamp.toFixed(2)}s · Adjustment: {d.adjustment >= 0 ? '+' : ''}{d.adjustment.toFixed(2)}s</p>
                         <p>{d.accepted ? 'Refined' : 'Coarse retained'}: {d.reason}</p>
@@ -1540,7 +1551,7 @@ export default function PoseTestPage() {
                     </article>
                   })}</div>
                   {displayProposals.length === 3 && <button disabled={autoBusy} type="button" onClick={acceptAutomaticPhases} className="rounded bg-emerald-600 p-3">Accept proposals after visual review</button>}
-                  <details><summary>Candidate evidence (development)</summary><table className="text-xs"><thead><tr><th>Time</th><th>Target matched</th><th>Match score</th><th>Arm reach / torso</th><th>Local motion</th></tr></thead><tbody>{autoResult.candidates.map((c) => <tr key={c.frameId}><td>{c.timestamp.toFixed(2)}</td><td>{c.matched ? 'TARGET_A' : 'unresolved'}</td><td>{c.targetScore.toFixed(2)}</td><td>{c.reach?.toFixed(2) ?? 'unavailable'}</td><td>{c.motion?.toFixed(2) ?? 'unavailable'}</td></tr>)}</tbody></table></details>
+                  <details><summary>Candidate evidence (development)</summary><table className="text-xs"><thead><tr><th>Time</th><th>Target matched</th><th>Match score</th><th>Arm reach / torso</th><th>Local motion</th><th>Identity evidence</th></tr></thead><tbody>{autoResult.candidates.map((c) => <tr key={c.frameId}><td>{c.timestamp.toFixed(2)}</td><td>{c.matched ? 'TARGET_A' : 'unresolved'}</td><td>{c.targetScore.toFixed(2)}</td><td>{c.reach?.toFixed(2) ?? 'unavailable'}</td><td>{c.motion?.toFixed(2) ?? 'unavailable'}</td><td>{autoCache.current.get(c.frameId)?.identity?.reason ?? 'No identity evidence'}</td></tr>)}</tbody></table></details>
                 </>}
                 <div className="text-sm">{phases.map((phase) => <p key={phase}>{phase}: {selectionOrigin[phase]} · {phaseFrames.find((f) => f.frameId === selectedFrameByPhase[phase])?.timestampSeconds.toFixed(2) ?? '—'}s</p>)}</div>
                 <button type="button" disabled={autoBusy || !displayProposals.length} onClick={analyzeAcceptedPhases} className="rounded border border-emerald-500 p-3 disabled:opacity-40">Analyze selected frames for TARGET_A</button>

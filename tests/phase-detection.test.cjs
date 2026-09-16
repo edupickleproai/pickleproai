@@ -284,3 +284,82 @@ test('all worse challengers preserve coarse fallback', () => {
   const { baseline, challengers } = mixedFixture([-0.1, -0.2, -0.01])
   assert.deepEqual(selectMixedPhases(baseline, challengers), baseline)
 })
+
+const { identityStep, trackIdentity, refineIdentity, identitySequenceAllowed } = mod.exports
+const observation = (t, x, area = 0.08) => ({ timestamp: t, features: { ...player(x), area } })
+const detection = (index, x, area = 0.08) => ({ poseIndex: index, features: { ...player(x), area } })
+test('identity follows changing indices through normal movement beyond original anchor', () => {
+  const frames = Array.from({length: 9}, (_, i) => ({ frameId: 'id'+i, timestamp: (i+1)*0.5, candidates: [detection([3,1,2][i%3], 0.2+(i+1)*0.035)] }))
+  const result = trackIdentity(observation(0,0.2), frames, 1)
+  assert.ok([...result.values()].every(e=>e.accepted))
+  assert.equal(result.get('id8').poseIndex,2)
+})
+test('identity permits gradual scale change', () => {
+  const e=identityStep([observation(0,0.2)],0.5,[detection(3,0.22,0.095)],1)
+  assert.equal(e.accepted,true)
+})
+test('best positional score cannot override predicted trajectory', () => {
+  const e=identityStep([observation(0,0.2),observation(0.5,0.27)],1,[detection(1,0.27),detection(3,0.34)],1)
+  // Two geometrically plausible people: abstain rather than choose by score.
+  assert.equal(e.accepted,false)
+  assert.match(e.reason,/Ambiguous/)
+})
+test('crossing ambiguity locks continuity instead of transferring it later', () => {
+  const result=trackIdentity(observation(0,0.3),[
+    {frameId:'cross',timestamp:0.5,candidates:[detection(1,0.31),detection(2,0.34)]},
+    {frameId:'after',timestamp:1,candidates:[detection(2,0.31)]}],1)
+  assert.equal(result.get('cross').accepted,false)
+  assert.equal(result.get('after').accepted,false)
+})
+test('disappearance does not substitute a distant teammate', () => {
+  assert.equal(identityStep([observation(0,0.2)],0.5,[detection(1,0.5)],1).accepted,false)
+})
+test('brief disappearance can reacquire only a unique consistent observation', () => {
+  const result=trackIdentity(observation(0,0.2),[
+    {frameId:'missing',timestamp:0.5,candidates:[]},
+    {frameId:'return',timestamp:1,candidates:[detection(3,0.22)]}],1)
+  assert.equal(result.get('missing').accepted,false)
+  assert.equal(result.get('return').accepted,true)
+})
+test('long gap cannot reacquire a teammate occupying the original anchor', () => {
+  const result=trackIdentity(observation(0,0.2),[
+    {frameId:'gone',timestamp:0.5,candidates:[]},
+    {frameId:'replacement',timestamp:2,candidates:[detection(2,0.2)]},
+    {frameId:'later',timestamp:2.5,candidates:[detection(2,0.2)]}],1)
+  assert.ok([...result.values()].every(e=>!e.accepted))
+})
+test('weak visibility, scale discontinuity and malformed geometry fail closed', () => {
+  const weak=detection(1,0.2);weak.features.landmarks[11].visibility=0.1
+  for(const candidate of [weak,detection(1,0.2,0.2),detection(1,NaN)])
+    assert.equal(identityStep([observation(0,0.2)],0.5,[candidate],1).accepted,false)
+})
+test('identity propagates backward from an interior anchor deterministically', () => {
+  const frames=[{frameId:'left',timestamp:0.5,candidates:[detection(3,0.27)]},{frameId:'right',timestamp:1.5,candidates:[detection(2,0.33)]}]
+  const a=trackIdentity(observation(1,0.3),frames,1)
+  assert.ok([...a.values()].every(e=>e.accepted))
+  assert.deepEqual(a,trackIdentity(observation(1,0.3),frames.slice().reverse(),1))
+})
+test('refinement requires agreeing identity evidence on both temporal sides', () => {
+  const refs=[observation(0,0.2),observation(1,0.24)]
+  assert.equal(refineIdentity(refs,0.5,[detection(3,0.22)],1).accepted,true)
+  assert.equal(refineIdentity(refs,1.5,[detection(3,0.24)],1).accepted,false)
+  assert.equal(refineIdentity(refs,0.5,[detection(3,0.22),detection(2,0.24)],1).accepted,false)
+})
+test('identity-rejected or missing phases block acceptance and biomechanics authorization', () => {
+  const valid=identityStep([observation(0,0.2)],0.5,[detection(3,0.22)],1)
+  const evidence=new Map([['r',valid],['c',valid],['x',valid]])
+  assert.equal(identitySequenceAllowed(['r','c','x'],id=>evidence.get(id)),true)
+  evidence.set('c',{accepted:false,poseIndex:null,score:0,reason:'identity lost'})
+  assert.equal(identitySequenceAllowed(['r','c','x'],id=>evidence.get(id)),false)
+  assert.equal(identitySequenceAllowed(['r','missing','x'],id=>evidence.get(id)),false)
+  assert.equal(identitySequenceAllowed(['r','r','x'],id=>evidence.get(id)),false)
+})
+test('page guards both phase acceptance and automatic biomechanics before side effects', () => {
+  const source=fs.readFileSync(path.resolve(__dirname,'../src/app/pose-test/page.tsx'),'utf8')
+  assert.equal(ts.createSourceFile('page.tsx',source,ts.ScriptTarget.Latest,true,ts.ScriptKind.TSX).parseDiagnostics.length,0)
+  const accept=source.slice(source.indexOf('const acceptAutomaticPhases'),source.indexOf('const analyzeAcceptedPhases'))
+  const analyze=source.slice(source.indexOf('const analyzeAcceptedPhases'),source.indexOf('const handleDetectPose'))
+  assert.ok(accept.indexOf('identitySequenceAllowed') < accept.indexOf('setSelectedFrameByPhase'))
+  assert.ok(analyze.indexOf('identitySequenceAllowed') < analyze.indexOf('await handleDetectPose'))
+  assert.match(analyze,/biomechanics blocked/)
+})

@@ -23,6 +23,72 @@ export function planCoarseSampling(duration: number) {
 export type Landmark = { x: number; y: number; visibility?: number }
 export type PlayerFeatures = { center: { x: number; y: number }; area: number; landmarks: Landmark[] }
 
+export type IdentityObservation = { timestamp: number; features: PlayerFeatures }
+export type IdentityEvidence = { accepted: boolean; poseIndex: number | null; score: number; reason: string; observation?: IdentityObservation }
+export type IdentityCandidate = { poseIndex: number; features: PlayerFeatures }
+// Geometric continuity is evidence, not recognition. Never restart from the old
+// anchor after a crossing or long gap: similar teammates cannot be distinguished.
+export function identityStep(history: IdentityObservation[], timestamp: number, candidates: IdentityCandidate[], aspect: number): IdentityEvidence {
+  const reject = (reason: string): IdentityEvidence => ({ accepted: false, poseIndex: null, score: 0, reason })
+  const last = history[history.length - 1]
+  if (!last || !Number.isFinite(timestamp) || !Number.isFinite(aspect) || aspect <= 0) return reject('Missing identity reference')
+  const dt = timestamp - last.timestamp
+  if (Math.abs(dt) > 1.2 || Math.abs(dt) < 0.000001) return reject('Unsupported identity gap; manual re-anchor required')
+  const previous = history[history.length - 2]
+  const velocity = previous && (last.timestamp - previous.timestamp) * dt > 0
+    ? { x: (last.features.center.x - previous.features.center.x) / (last.timestamp - previous.timestamp), y: (last.features.center.y - previous.features.center.y) / (last.timestamp - previous.timestamp) }
+    : { x: 0, y: 0 }
+  const expected = { x: last.features.center.x + velocity.x * dt, y: last.features.center.y + velocity.y * dt }
+  const distance = (a: PlayerFeatures['center'], b: PlayerFeatures['center']) => Math.hypot((a.x - b.x) * aspect, a.y - b.y)
+  // A modest acceleration allowance; missing observations never expand the gate
+  // indefinitely. Scale is compared to the latest observation, not anchor size.
+  const radius = 0.035 + 0.10 * Math.abs(dt)
+  const plausible = candidates.filter(({ features: f }) => f.area > 0 && Number.isFinite(f.area)
+    && distance(f.center, expected) <= radius
+    && Math.abs(Math.log(f.area / last.features.area)) <= 0.45)
+  if (plausible.length > 1) return reject('Ambiguous crossing / competing identity trajectories; manual re-anchor required')
+  if (!plausible.length) return reject('No motion-consistent TARGET_A observation')
+  const match = matchPhaseTarget(last.features, plausible)
+  if (!match.reliable) return reject(`Weak identity evidence: ${match.rejection}`)
+  const winner = plausible[0]
+  return { accepted: true, poseIndex: winner.poseIndex, score: match.score, reason: 'Unique short-gap trajectory, compatible scale and visible torso', observation: { timestamp, features: winner.features } }
+}
+
+export function trackIdentity(anchor: IdentityObservation, frames: Array<{ frameId: string; timestamp: number; candidates: IdentityCandidate[] }>, aspect: number) {
+  const evidence = new Map<string, IdentityEvidence>()
+  for (const direction of [-1, 1]) {
+    const history = [anchor]
+    let locked = false
+    const ordered = frames.filter((f) => (f.timestamp - anchor.timestamp) * direction > 0.000001)
+      .sort((a, b) => direction * (a.timestamp - b.timestamp) || a.frameId.localeCompare(b.frameId))
+    for (const frame of ordered) {
+      const result = locked ? { accepted: false, poseIndex: null, score: 0, reason: 'Identity continuity lost; manual re-anchor required' } : identityStep(history, frame.timestamp, frame.candidates, aspect)
+      evidence.set(frame.frameId, result)
+      if (result.observation) history.push(result.observation)
+      if (result.reason.includes('manual re-anchor')) locked = true
+    }
+  }
+  return evidence
+}
+
+// Refined candidates need agreement from trusted observations on BOTH sides.
+export function refineIdentity(references: IdentityObservation[], timestamp: number, candidates: IdentityCandidate[], aspect: number): IdentityEvidence {
+  const before = references.filter((r) => r.timestamp < timestamp).sort((a, b) => a.timestamp - b.timestamp)
+  const after = references.filter((r) => r.timestamp > timestamp).sort((a, b) => b.timestamp - a.timestamp)
+  const a = identityStep(before.slice(-2), timestamp, candidates, aspect)
+  const b = identityStep(after.slice(-2), timestamp, candidates, aspect)
+  if (!a.accepted || !b.accepted || a.poseIndex !== b.poseIndex) return { accepted: false, poseIndex: null, score: 0, reason: 'Refinement lacks agreeing identity continuity on both sides' }
+  return { ...a, reason: 'Identity supported by trusted observations before and after' }
+}
+
+// Shared by phase acceptance and automatic biomechanics: absence fails closed.
+export function identitySequenceAllowed(frameIds: string[], lookup: (id: string) => IdentityEvidence | undefined) {
+  return frameIds.length === 3 && new Set(frameIds).size === 3 && frameIds.every((id) => {
+    const e = lookup(id)
+    return e?.accepted === true && e.poseIndex !== null && !!e.observation
+  })
+}
+
 // Existing TARGET_A anchor score, unchanged. Indices are never identity features.
 export function scorePlayerMatch(anchor: PlayerFeatures, cand: PlayerFeatures) {
   const dist = Math.hypot(anchor.center.x - cand.center.x, anchor.center.y - cand.center.y)
