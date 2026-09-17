@@ -26,14 +26,23 @@ export type PlayerFeatures = { center: { x: number; y: number }; area: number; l
 export type IdentityObservation = { timestamp: number; features: PlayerFeatures }
 export type IdentityEvidence = { accepted: boolean; poseIndex: number | null; score: number; reason: string; observation?: IdentityObservation }
 export type IdentityCandidate = { poseIndex: number; features: PlayerFeatures }
+// Development-only observations; callbacks never participate in decisions.
+export type IdentityDiagnostic = {
+  code: string; continuity: 'tracking' | 'locked'; ambiguity: boolean
+  evaluated: number; plausible: number
+  candidates: Array<{ poseIndex: number; plausible: boolean; reasons: string[] }>
+}
+export type IdentityObserver = (diagnostic: IdentityDiagnostic) => void
 // Geometric continuity is evidence, not recognition. Never restart from the old
 // anchor after a crossing or long gap: similar teammates cannot be distinguished.
-export function identityStep(history: IdentityObservation[], timestamp: number, candidates: IdentityCandidate[], aspect: number): IdentityEvidence {
+export function identityStep(history: IdentityObservation[], timestamp: number, candidates: IdentityCandidate[], aspect: number, observe?: IdentityObserver): IdentityEvidence {
+  const diagnostic: IdentityDiagnostic = { code: '', continuity: 'tracking', ambiguity: false, evaluated: 0, plausible: 0, candidates: [] }
+  const report = (code: string, locked = false) => { diagnostic.code = code; diagnostic.continuity = locked ? 'locked' : 'tracking'; observe?.(diagnostic) }
   const reject = (reason: string): IdentityEvidence => ({ accepted: false, poseIndex: null, score: 0, reason })
   const last = history[history.length - 1]
-  if (!last || !Number.isFinite(timestamp) || !Number.isFinite(aspect) || aspect <= 0) return reject('Missing identity reference')
+  if (!last || !Number.isFinite(timestamp) || !Number.isFinite(aspect) || aspect <= 0) { report('MISSING_IDENTITY_REFERENCE'); return reject('Missing identity reference') }
   const dt = timestamp - last.timestamp
-  if (Math.abs(dt) > 1.2 || Math.abs(dt) < 0.000001) return reject('Unsupported identity gap; manual re-anchor required')
+  if (Math.abs(dt) > 1.2 || Math.abs(dt) < 0.000001) { report('UNSUPPORTED_IDENTITY_GAP', true); return reject('Unsupported identity gap; manual re-anchor required') }
   const previous = history[history.length - 2]
   const velocity = previous && (last.timestamp - previous.timestamp) * dt > 0
     ? { x: (last.features.center.x - previous.features.center.x) / (last.timestamp - previous.timestamp), y: (last.features.center.y - previous.features.center.y) / (last.timestamp - previous.timestamp) }
@@ -43,18 +52,34 @@ export function identityStep(history: IdentityObservation[], timestamp: number, 
   // A modest acceleration allowance; missing observations never expand the gate
   // indefinitely. Scale is compared to the latest observation, not anchor size.
   const radius = 0.035 + 0.10 * Math.abs(dt)
-  const plausible = candidates.filter(({ features: f }) => f.area > 0 && Number.isFinite(f.area)
-    && distance(f.center, expected) <= radius
-    && Math.abs(Math.log(f.area / last.features.area)) <= 0.45)
-  if (plausible.length > 1) return reject('Ambiguous crossing / competing identity trajectories; manual re-anchor required')
-  if (!plausible.length) return reject('No motion-consistent TARGET_A observation')
+  const plausible = candidates.filter(({ poseIndex, features: f }) => {
+    const areaValid = f.area > 0 && Number.isFinite(f.area)
+    const trajectoryValid = distance(f.center, expected) <= radius
+    const scaleValid = Math.abs(Math.log(f.area / last.features.area)) <= 0.45
+    const valid = areaValid && trajectoryValid && scaleValid
+    diagnostic.candidates.push({ poseIndex, plausible: valid, reasons: [
+      ...(!areaValid ? ['INVALID_AREA'] : []),
+      ...(!trajectoryValid ? ['IDENTITY_TRAJECTORY_REJECTED'] : []),
+      ...(!scaleValid ? ['IDENTITY_SCALE_REJECTED'] : []),
+    ] })
+    return valid
+  })
+  diagnostic.evaluated = candidates.length
+  diagnostic.plausible = plausible.length
+  if (plausible.length > 1) { diagnostic.ambiguity = true; report('AMBIGUOUS_CANDIDATES', true); return reject('Ambiguous crossing / competing identity trajectories; manual re-anchor required') }
+  if (!plausible.length) { report(candidates.length ? 'NO_PLAUSIBLE_TARGET' : 'NO_POSE_DETECTED'); return reject('No motion-consistent TARGET_A observation') }
   const match = matchPhaseTarget(last.features, plausible)
-  if (!match.reliable) return reject(`Weak identity evidence: ${match.rejection}`)
+  if (!match.reliable) {
+    diagnostic.candidates.find((c) => c.plausible)!.reasons.push(`MATCH_${(match.rejection ?? 'UNKNOWN').toUpperCase().replace(/ /g, '_')}`)
+    report('IDENTITY_POSE_REJECTED')
+    return reject(`Weak identity evidence: ${match.rejection}`)
+  }
+  report('ACCEPTED_TARGET')
   const winner = plausible[0]
   return { accepted: true, poseIndex: winner.poseIndex, score: match.score, reason: 'Unique short-gap trajectory, compatible scale and visible torso', observation: { timestamp, features: winner.features } }
 }
 
-export function trackIdentity(anchor: IdentityObservation, frames: Array<{ frameId: string; timestamp: number; candidates: IdentityCandidate[] }>, aspect: number) {
+export function trackIdentity(anchor: IdentityObservation, frames: Array<{ frameId: string; timestamp: number; candidates: IdentityCandidate[] }>, aspect: number, observe?: (frameId: string, diagnostic: IdentityDiagnostic) => void) {
   const evidence = new Map<string, IdentityEvidence>()
   for (const direction of [-1, 1]) {
     const history = [anchor]
@@ -62,7 +87,8 @@ export function trackIdentity(anchor: IdentityObservation, frames: Array<{ frame
     const ordered = frames.filter((f) => (f.timestamp - anchor.timestamp) * direction > 0.000001)
       .sort((a, b) => direction * (a.timestamp - b.timestamp) || a.frameId.localeCompare(b.frameId))
     for (const frame of ordered) {
-      const result = locked ? { accepted: false, poseIndex: null, score: 0, reason: 'Identity continuity lost; manual re-anchor required' } : identityStep(history, frame.timestamp, frame.candidates, aspect)
+      if (locked) observe?.(frame.frameId, { code: 'CONTINUITY_LOCKED', continuity: 'locked', ambiguity: false, evaluated: 0, plausible: 0, candidates: [] })
+      const result = locked ? { accepted: false, poseIndex: null, score: 0, reason: 'Identity continuity lost; manual re-anchor required' } : identityStep(history, frame.timestamp, frame.candidates, aspect, (d) => observe?.(frame.frameId, d))
       evidence.set(frame.frameId, result)
       if (result.observation) history.push(result.observation)
       if (result.reason.includes('manual re-anchor')) locked = true

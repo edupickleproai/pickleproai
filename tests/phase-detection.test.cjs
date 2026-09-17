@@ -363,3 +363,71 @@ test('page guards both phase acceptance and automatic biomechanics before side e
   assert.ok(analyze.indexOf('identitySequenceAllowed') < analyze.indexOf('await handleDetectPose'))
   assert.match(analyze,/biomechanics blocked/)
 })
+
+const observeStep = (history, time, candidates) => {
+  let diagnostic
+  const result = identityStep(history, time, candidates, 1, d => { diagnostic = d })
+  assert.deepEqual(result, identityStep(history, time, candidates, 1))
+  return { result, diagnostic }
+}
+test('observability: zero detections is explicit, without changing rejection', () => {
+  const {diagnostic, result} = observeStep([observation(0,0.2)],0.5,[])
+  assert.equal(diagnostic.code,'NO_POSE_DETECTED')
+  assert.equal(diagnostic.evaluated,0)
+  assert.equal(result.reason,'No motion-consistent TARGET_A observation')
+})
+test('observability: rejected candidates retain all geometric failure reasons', () => {
+  const {diagnostic} = observeStep([observation(0,0.2)],0.5,[detection(2,0.8,0.3)])
+  assert.equal(diagnostic.code,'NO_PLAUSIBLE_TARGET')
+  assert.equal(diagnostic.evaluated,1)
+  assert.equal(diagnostic.plausible,0)
+  assert.deepEqual(diagnostic.candidates[0].reasons,['IDENTITY_TRAJECTORY_REJECTED','IDENTITY_SCALE_REJECTED'])
+})
+test('observability: plausible pose failing integrity is distinct from no candidate', () => {
+  const weak=detection(7,0.22); weak.features.landmarks[11].visibility=0.1
+  const {diagnostic} = observeStep([observation(0,0.2)],0.5,[weak])
+  assert.equal(diagnostic.code,'IDENTITY_POSE_REJECTED')
+  assert.equal(diagnostic.plausible,1)
+  assert.deepEqual(diagnostic.candidates[0].reasons,['MATCH_TORSO_VISIBILITY'])
+})
+test('observability: ambiguity has candidates and locks continuity', () => {
+  const {diagnostic} = observeStep([observation(0,0.2)],0.5,[detection(1,0.21),detection(2,0.22)])
+  assert.equal(diagnostic.code,'AMBIGUOUS_CANDIDATES')
+  assert.equal(diagnostic.ambiguity,true)
+  assert.equal(diagnostic.plausible,2)
+  assert.equal(diagnostic.continuity,'locked')
+})
+test('observability: accepted target and per-frame index remain diagnostic only', () => {
+  for (const index of [1,7,23]) {
+    const {diagnostic,result} = observeStep([observation(0,0.2)],0.5,[detection(index,0.22)])
+    assert.equal(diagnostic.code,'ACCEPTED_TARGET')
+    assert.equal(result.accepted,true)
+    assert.equal(result.poseIndex,index)
+    assert.equal(diagnostic.candidates[0].poseIndex,index)
+  }
+})
+test('observability: gap rejection differs from subsequent continuity lockout', () => {
+  const diagnostics=new Map()
+  const frames=[{frameId:'gap',timestamp:2,candidates:[detection(1,0.2)]},{frameId:'locked',timestamp:2.5,candidates:[detection(2,0.2)]}]
+  trackIdentity(observation(0,0.2),frames,1,(id,d)=>diagnostics.set(id,d))
+  assert.equal(diagnostics.get('gap').code,'UNSUPPORTED_IDENTITY_GAP')
+  assert.equal(diagnostics.get('locked').code,'CONTINUITY_LOCKED')
+  assert.equal(diagnostics.get('locked').evaluated,0)
+  assert.deepEqual(diagnostics.get('locked').candidates,[])
+})
+test('observability: tracking and downstream phase outputs unchanged with observer', () => {
+  const frames=Array.from({length:9},(_,i)=>({frameId:`audit${i}`,timestamp:(i+1)*0.5,candidates:[detection(i%3+1,0.2+(i+1)*0.035)]}))
+  const before=trackIdentity(observation(0,0.2),frames,1)
+  const diagnostics=[]
+  const after=trackIdentity(observation(0,0.2),frames,1,(_,d)=>diagnostics.push(d))
+  assert.deepEqual(after,before)
+  assert.equal(diagnostics.length,9)
+  const toPhases = map => frames.map((f,i)=>({frameId:f.frameId,timestamp:f.timestamp,matched:map.get(f.frameId).accepted,targetScore:map.get(f.frameId).score,reach:1+i%3,wrist:{x:i%3,y:0}}))
+  assert.deepEqual(detectPhases(toPhases(after)),detectPhases(toPhases(before)))
+  assert.ok(diagnostics.every(d=>!JSON.stringify(d).includes('landmarks')))
+})
+test('observability: missing identity reference is not a fabricated detection failure', () => {
+  const {diagnostic} = observeStep([],0.5,[])
+  assert.equal(diagnostic.code,'MISSING_IDENTITY_REFERENCE')
+  assert.equal(diagnostic.evaluated,0)
+})

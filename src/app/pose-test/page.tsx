@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, type ChangeEvent } from 'react'
 import BiomechanicsPanel from './BiomechanicsPanel'
-import { trackIdentity, refineIdentity, identitySequenceAllowed, type IdentityEvidence, type IdentityObservation } from '@/lib/phase-detection'
+import { trackIdentity, refineIdentity, identitySequenceAllowed, type IdentityEvidence, type IdentityObservation, type IdentityDiagnostic } from '@/lib/phase-detection'
 import type { NormalizedLandmark } from '@mediapipe/tasks-vision'
 import { planCoarseSampling, detectPhases, overridePhase, phaseGeometry, planPhaseRefinement, refinePhases, type RefinementResult, type PhaseResult, type PhaseCandidate } from '@/lib/phase-detection'
 import { buildCoachingBiomechanicsPayload, clearStoredVideoBiomechanics, COACHING_BIOMECHANICS_STORAGE_KEY, videoFingerprint } from '@/lib/coaching-biomechanics'
@@ -389,7 +389,10 @@ export default function PoseTestPage() {
   const [autoBusy, setAutoBusy] = useState(false)
   const [paddleHand, setPaddleHand] = useState<'left' | 'right'>('right')
   const [selectionOrigin, setSelectionOrigin] = useState<Record<Phase, string>>({ ready: 'MANUAL', contact: 'MANUAL', recovery: 'MANUAL' })
-  const autoCache = useRef(new Map<string, { image: HTMLImageElement; poses: PoseResult[]; poseIndex: number | null; score: number; identity?: IdentityEvidence }>())
+  type DetectionAudit = { raw: number; sources: Record<string, number>; candidates: PoseResult[] }
+  const detectionAudits = useRef(new WeakMap<PoseResult, DetectionAudit>())
+  const [inspectedFrame, setInspectedFrame] = useState<string | null>(null)
+  const autoCache = useRef(new Map<string, { image: HTMLImageElement; poses: PoseResult[]; poseIndex: number | null; score: number; identity?: IdentityEvidence; detection?: DetectionAudit; diagnostic?: IdentityDiagnostic }>())
 
   const imageRefs = useRef<Record<Phase, HTMLImageElement | null>>({} as any)
   const canvasRefs = useRef<Record<Phase, HTMLCanvasElement | null>>({} as any)
@@ -678,14 +681,16 @@ export default function PoseTestPage() {
   }
 
   // Multi-pass detection: full frame, then optional left/right crops.
-  const detectMultiPass = async (image: HTMLImageElement, fullSize: { width: number; height: number }) => {
+  const detectMultiPass = async (image: HTMLImageElement, fullSize: { width: number; height: number }, observe?: (audit: DetectionAudit) => void) => {
     const posesOut: any[] = []
+    const sources: Record<string, number> = {}
 
     // PASS A: full frame
     const full = await runLandmarker(image)
     const fullRes = full.result
     const fullWorld = fullRes.worldLandmarks ?? []
     const fullLandmarks = fullRes.landmarks ?? []
+    sources.FULL_FRAME = fullLandmarks.length
     if (fullLandmarks && fullLandmarks.length > 0) {
       for (let i = 0; i < fullLandmarks.length; i++) {
         const lms = fullLandmarks[i]
@@ -718,6 +723,7 @@ export default function PoseTestPage() {
         const resCrop = await runLandmarker(img)
         const r = resCrop.result
         const lm = r.landmarks ?? []
+        sources[label] = lm.length
         const wl = r.worldLandmarks ?? []
         for (let i = 0; i < lm.length; i++) {
           // map landmark x,y back to full-frame normalized coords
@@ -768,6 +774,9 @@ export default function PoseTestPage() {
       if (!dup) deduped.push(p)
     }
 
+    const audit: DetectionAudit = { raw: posesOut.length, sources, candidates: deduped }
+    for (const p of deduped) detectionAudits.current.set(p, audit)
+    observe?.(audit)
     return deduped
   }
 
@@ -876,9 +885,10 @@ export default function PoseTestPage() {
         image.src = frame.imageDataUrl
         await image.decode()
         const size = { width: image.naturalWidth, height: image.naturalHeight }
-        const poses = Math.abs(frame.timestampSeconds - (persistentAnchor.timestamp ?? -1)) < 0.000001 ? [persistentAnchor.pose] : await detectMultiPass(image, size)
+        let detection = detectionAudits.current.get(persistentAnchor.pose)
+        const poses = Math.abs(frame.timestampSeconds - (persistentAnchor.timestamp ?? -1)) < 0.000001 ? [persistentAnchor.pose] : await detectMultiPass(image, size, (audit) => { detection = audit })
         if (generation !== sourceGeneration.current) return
-        autoCache.current.set(frame.frameId, { image, poses, poseIndex: null, score: 0 })
+        autoCache.current.set(frame.frameId, { image, poses, poseIndex: null, score: 0, detection })
         await new Promise((resolve) => setTimeout(resolve, 0))
       }
       if (generation !== sourceGeneration.current) return
@@ -888,13 +898,14 @@ export default function PoseTestPage() {
         const entry = autoCache.current.get(f.frameId)!
         return { frameId: f.frameId, timestamp: f.timestampSeconds, candidates: entry.poses.map((pose) => ({ poseIndex: pose.poseIndex, features: extractFeatures(pose, { width: entry.image.naturalWidth, height: entry.image.naturalHeight }) })) }
       })
-      const identities = trackIdentity({ timestamp: anchorTime, features: persistentAnchor.features }, observations, videoMeta!.width / videoMeta!.height)
+      const identities = trackIdentity({ timestamp: anchorTime, features: persistentAnchor.features }, observations, videoMeta!.width / videoMeta!.height, (id, diagnostic) => { autoCache.current.get(id)!.diagnostic = diagnostic })
       for (const frame of frames) {
         const entry = autoCache.current.get(frame.frameId)!
         const identity: IdentityEvidence = Math.abs(frame.timestampSeconds - anchorTime) < 0.000001
           ? { accepted: true, poseIndex: persistentAnchor.poseIndex, score: 1, reason: 'User-selected physical player anchor', observation: { timestamp: anchorTime, features: persistentAnchor.features } }
           : identities.get(frame.frameId)!
         entry.identity = identity
+        if (Math.abs(frame.timestampSeconds - anchorTime) < 0.000001) entry.diagnostic = { code: 'USER_SELECTED_ANCHOR', continuity: 'tracking', ambiguity: false, evaluated: 0, plausible: 0, candidates: [] }
         entry.poseIndex = identity.poseIndex
         entry.score = identity.score
         const target = entry.poses.find((p) => p.poseIndex === identity.poseIndex)
@@ -1551,7 +1562,44 @@ export default function PoseTestPage() {
                     </article>
                   })}</div>
                   {displayProposals.length === 3 && <button disabled={autoBusy} type="button" onClick={acceptAutomaticPhases} className="rounded bg-emerald-600 p-3">Accept proposals after visual review</button>}
-                  <details><summary>Candidate evidence (development)</summary><table className="text-xs"><thead><tr><th>Time</th><th>Target matched</th><th>Match score</th><th>Arm reach / torso</th><th>Local motion</th><th>Identity evidence</th></tr></thead><tbody>{autoResult.candidates.map((c) => <tr key={c.frameId}><td>{c.timestamp.toFixed(2)}</td><td>{c.matched ? 'TARGET_A' : 'unresolved'}</td><td>{c.targetScore.toFixed(2)}</td><td>{c.reach?.toFixed(2) ?? 'unavailable'}</td><td>{c.motion?.toFixed(2) ?? 'unavailable'}</td><td>{autoCache.current.get(c.frameId)?.identity?.reason ?? 'No identity evidence'}</td></tr>)}</tbody></table></details>
+                  <details><summary>Candidate evidence (development)</summary>
+                    <p className="text-xs">Poses = raw/remapped detections; candidates = after deduplication. Pose numbers identify detections in this frame only. Select a time to inspect boxes. Locked frames are not evaluated for identity.</p>
+                    <div className="overflow-x-auto"><table className="text-xs"><thead><tr><th>Time</th><th>Poses / candidates</th><th>Sources (raw counts)</th><th>Evaluated / plausible</th><th>TARGET</th><th>Identity</th><th>Continuity</th><th>Ambiguity</th><th>Motion</th><th>Reason</th></tr></thead><tbody>{autoResult.candidates.map((c) => {
+                      const entry = autoCache.current.get(c.frameId)
+                      const d = entry?.diagnostic
+                      return <tr key={c.frameId} className="border-t border-slate-700">
+                        <td><button type="button" className="underline p-1" onClick={() => setInspectedFrame(c.frameId)}>{c.timestamp.toFixed(2)}s</button></td>
+                        <td>{entry?.detection?.raw ?? 'unknown'} / {entry?.detection?.candidates.length ?? 'unknown'}</td>
+                        <td>{Object.entries(entry?.detection?.sources ?? {}).map(([source, count]) => `${source}: ${count}`).join(', ') || 'none'}</td>
+                        <td>{d?.evaluated ?? '—'} / {d?.plausible ?? '—'}</td>
+                        <td>{c.matched ? `TARGET_A · pose #${entry?.poseIndex}` : 'None'}</td>
+                        <td>{c.matched ? 'Accepted' : d?.evaluated ? 'Rejected' : 'Not evaluated'}</td>
+                        <td>{d?.continuity ?? 'unknown'}</td><td>{d?.ambiguity ? 'Yes' : d?.evaluated ? 'No' : 'Not evaluated'}</td>
+                        <td>{c.motion == null ? 'Unavailable' : `Usable · ${c.motion.toFixed(2)}`}</td>
+                        <td>{d?.code ?? 'UNKNOWN'}<br />{entry?.identity?.reason}</td>
+                      </tr>
+                    })}</tbody></table></div>
+                    {(() => {
+                      const frame = frames.find((f) => f.frameId === inspectedFrame)
+                      const entry = frame && autoCache.current.get(frame.frameId)
+                      if (!frame || !entry) return null
+                      const candidates = entry.detection?.candidates ?? entry.poses
+                      const label = (p: PoseResult) => {
+                        if (entry.identity?.accepted && entry.poseIndex === p.poseIndex) return 'TARGET_A accepted'
+                        const candidate = entry.diagnostic?.candidates.find((c) => c.poseIndex === p.poseIndex)
+                        if (!candidate) return 'Not evaluated'
+                        return `Rejected: ${candidate.reasons.join(', ') || entry.diagnostic?.code}`
+                      }
+                      return <div className="mt-3 space-y-2">
+                        <p>Frame {frame.timestampSeconds.toFixed(3)}s · {entry.diagnostic?.code}. {entry.diagnostic?.code === 'USER_SELECTED_ANCHOR' ? 'Original anchor detections reused; no rescan.' : ''}</p>
+                        <div className="relative max-w-3xl"><img src={frame.imageDataUrl} alt={`Identity audit at ${frame.timestampSeconds.toFixed(3)} seconds`} />
+                          {candidates.map((p) => <div key={p.poseIndex} className={`absolute border-2 pointer-events-none ${entry.identity?.accepted && entry.poseIndex === p.poseIndex ? 'border-emerald-400' : 'border-amber-400'}`} style={{ left: `${100 * p.bbox.left / entry.image.naturalWidth}%`, top: `${100 * p.bbox.top / entry.image.naturalHeight}%`, width: `${100 * p.bbox.width / entry.image.naturalWidth}%`, height: `${100 * p.bbox.height / entry.image.naturalHeight}%` }}><span className="bg-slate-950 text-xs">#{p.poseIndex} · {label(p)}</span></div>)}
+                        </div>
+                        {candidates.length === 0 && <p>No detected candidate boxes.</p>}
+                        {candidates.map((p) => <p className="text-xs" key={p.poseIndex}>Pose #{p.poseIndex} · {p.detectionSource} · {label(p)}</p>)}
+                      </div>
+                    })()}
+                  </details>
                 </>}
                 <div className="text-sm">{phases.map((phase) => <p key={phase}>{phase}: {selectionOrigin[phase]} · {phaseFrames.find((f) => f.frameId === selectedFrameByPhase[phase])?.timestampSeconds.toFixed(2) ?? '—'}s</p>)}</div>
                 <button type="button" disabled={autoBusy || !displayProposals.length} onClick={analyzeAcceptedPhases} className="rounded border border-emerald-500 p-3 disabled:opacity-40">Analyze selected frames for TARGET_A</button>
