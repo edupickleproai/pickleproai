@@ -898,7 +898,11 @@ export default function PoseTestPage() {
         const entry = autoCache.current.get(f.frameId)!
         return { frameId: f.frameId, timestamp: f.timestampSeconds, candidates: entry.poses.map((pose) => ({ poseIndex: pose.poseIndex, features: extractFeatures(pose, { width: entry.image.naturalWidth, height: entry.image.naturalHeight }) })) }
       })
-      const identities = trackIdentity({ timestamp: anchorTime, features: persistentAnchor.features }, observations, videoMeta!.width / videoMeta!.height, (id, diagnostic) => { autoCache.current.get(id)!.diagnostic = diagnostic })
+      const anchorEntry = frames.map((f) => autoCache.current.get(f.frameId)!).find((e) => e.poses.includes(persistentAnchor.pose))
+      const competitors = (anchorEntry?.detection?.candidates ?? []).filter((p) => p !== persistentAnchor.pose)
+        .map((p) => extractFeatures(p, { width: anchorEntry!.image.naturalWidth, height: anchorEntry!.image.naturalHeight }))
+      const identities = trackIdentity({ timestamp: anchorTime, features: persistentAnchor.features }, observations, videoMeta!.width / videoMeta!.height,
+        (id, diagnostic) => { autoCache.current.get(id)!.diagnostic = diagnostic }, { competitors })
       for (const frame of frames) {
         const entry = autoCache.current.get(frame.frameId)!
         const identity: IdentityEvidence = Math.abs(frame.timestampSeconds - anchorTime) < 0.000001
@@ -1563,7 +1567,7 @@ export default function PoseTestPage() {
                   })}</div>
                   {displayProposals.length === 3 && <button disabled={autoBusy} type="button" onClick={acceptAutomaticPhases} className="rounded bg-emerald-600 p-3">Accept proposals after visual review</button>}
                   <details><summary>Candidate evidence (development)</summary>
-                    <p className="text-xs">Poses = raw/remapped detections; candidates = after deduplication. Pose numbers identify detections in this frame only. Select a time to inspect boxes. Locked frames are not evaluated for identity.</p>
+                    <p className="text-xs">Poses = raw/remapped detections; candidates = after deduplication. Pose numbers identify detections in this frame only. Select a time to inspect boxes. Locked frames use a separate conservative reacquisition check. Pending candidates are not TARGET_A and cannot supply biomechanics.</p>
                     <div className="overflow-x-auto"><table className="text-xs"><thead><tr><th>Time</th><th>Poses / candidates</th><th>Sources (raw counts)</th><th>Evaluated / plausible</th><th>TARGET</th><th>Identity</th><th>Continuity</th><th>Ambiguity</th><th>Motion</th><th>Reason</th></tr></thead><tbody>{autoResult.candidates.map((c) => {
                       const entry = autoCache.current.get(c.frameId)
                       const d = entry?.diagnostic
@@ -1573,10 +1577,10 @@ export default function PoseTestPage() {
                         <td>{Object.entries(entry?.detection?.sources ?? {}).map(([source, count]) => `${source}: ${count}`).join(', ') || 'none'}</td>
                         <td>{d?.evaluated ?? '—'} / {d?.plausible ?? '—'}</td>
                         <td>{c.matched ? `TARGET_A · pose #${entry?.poseIndex}` : 'None'}</td>
-                        <td>{c.matched ? 'Accepted' : d?.evaluated ? 'Rejected' : 'Not evaluated'}</td>
+                        <td>{c.matched ? 'Accepted' : d?.continuity === 'reacquisition_candidate' ? 'Pending (untrusted)' : d?.evaluated ? 'Rejected' : 'Not evaluated'}</td>
                         <td>{d?.continuity ?? 'unknown'}</td><td>{d?.ambiguity ? 'Yes' : d?.evaluated ? 'No' : 'Not evaluated'}</td>
                         <td>{c.motion == null ? 'Unavailable' : `Usable · ${c.motion.toFixed(2)}`}</td>
-                        <td>{d?.code ?? 'UNKNOWN'}<br />{entry?.identity?.reason}</td>
+                        <td>{d?.code ?? 'UNKNOWN'}<br />{entry?.identity?.reason}{d?.confirmation && <p>Confirmation: {d.confirmation.count}/{d.confirmation.required} · candidate {d.confirmation.poseIndex ?? 'none'}</p>}</td>
                       </tr>
                     })}</tbody></table></div>
                     {(() => {
@@ -1588,15 +1592,30 @@ export default function PoseTestPage() {
                         if (entry.identity?.accepted && entry.poseIndex === p.poseIndex) return 'TARGET_A accepted'
                         const candidate = entry.diagnostic?.candidates.find((c) => c.poseIndex === p.poseIndex)
                         if (!candidate) return 'Not evaluated'
+                        if (candidate.plausible && entry.diagnostic?.continuity === 'reacquisition_candidate') return 'Pending confirmation — untrusted'
                         return `Rejected: ${candidate.reasons.join(', ') || entry.diagnostic?.code}`
                       }
                       return <div className="mt-3 space-y-2">
+                        {entry.diagnostic?.prerequisites && (() => {
+                          const q = entry.diagnostic.prerequisites
+                          return <div className="border border-slate-700 p-2 text-xs space-y-1">
+                            <p>Reacquisition eligibility: {q.eligible ? 'ELIGIBLE' : 'BLOCKED'} · timestamp finite: {String(q.timestampFinite)}</p>
+                            <p>Target references: {q.target.usable} / {q.target.required} usable required · {q.target.available} available · {q.target.unique} unique timestamps</p>
+                            <p>Competitor references: {q.competitor.available} / {q.competitor.required} required · {q.competitor.usable} usable · all usable: {String(q.competitor.allUsable)}</p>
+                            <p>Failure reasons: {q.reasons.join(', ') || 'none'}</p>
+                            <p>Image-space reference geometry: positive finite aspect/area; finite center/coordinates; joints 11–16 and 23–28 visibility ≥0.75; torso ≥0.02; limbs ≥0.01. No detection-source equality requirement.</p>
+                            {q.references.filter((r) => !r.usable).map((r) => <p key={`${r.kind}-${r.index}`}>{r.kind} reference {r.index}{r.timestamp != null ? ` at ${r.timestamp.toFixed(3)}s` : ''}: {r.reasons.join(', ')}</p>)}
+                          </div>
+                        })()}
                         <p>Frame {frame.timestampSeconds.toFixed(3)}s · {entry.diagnostic?.code}. {entry.diagnostic?.code === 'USER_SELECTED_ANCHOR' ? 'Original anchor detections reused; no rescan.' : ''}</p>
                         <div className="relative max-w-3xl"><img src={frame.imageDataUrl} alt={`Identity audit at ${frame.timestampSeconds.toFixed(3)} seconds`} />
                           {candidates.map((p) => <div key={p.poseIndex} className={`absolute border-2 pointer-events-none ${entry.identity?.accepted && entry.poseIndex === p.poseIndex ? 'border-emerald-400' : 'border-amber-400'}`} style={{ left: `${100 * p.bbox.left / entry.image.naturalWidth}%`, top: `${100 * p.bbox.top / entry.image.naturalHeight}%`, width: `${100 * p.bbox.width / entry.image.naturalWidth}%`, height: `${100 * p.bbox.height / entry.image.naturalHeight}%` }}><span className="bg-slate-950 text-xs">#{p.poseIndex} · {label(p)}</span></div>)}
                         </div>
                         {candidates.length === 0 && <p>No detected candidate boxes.</p>}
-                        {candidates.map((p) => <p className="text-xs" key={p.poseIndex}>Pose #{p.poseIndex} · {p.detectionSource} · {label(p)}</p>)}
+                        {candidates.map((p) => {
+                          const d = entry.diagnostic?.candidates.find((c) => c.poseIndex === p.poseIndex)
+                          return <p className="text-xs" key={p.poseIndex}>Pose #{p.poseIndex} · {p.detectionSource} · {label(p)}{d?.targetDistance != null && ` · target pose distance ${d.targetDistance.toFixed(3)} · competitor distance ${d.competitorDistance?.toFixed(3)}`}</p>
+                        })}
                       </div>
                     })()}
                   </details>

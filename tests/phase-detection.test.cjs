@@ -431,3 +431,205 @@ test('observability: missing identity reference is not a fabricated detection fa
   assert.equal(diagnostic.code,'MISSING_IDENTITY_REFERENCE')
   assert.equal(diagnostic.evaluated,0)
 })
+
+// Reacquisition fixtures encode pose configuration, not appearance or pose IDs.
+const { evaluateReacquisition } = mod.exports
+function rqPlayer(x=0.3, teammate=false) {
+  const landmarks=Array.from({length:33},()=>({x,y:0.5,visibility:1}))
+  const joints={11:[-.05,.3],12:[.05,.3],13:[-.08,teammate?.2:.4],14:[.08,teammate?.2:.4],15:[-.12,teammate?.12:.48],16:[.12,teammate?.12:.48],23:[-.04,.5],24:[.04,.5],25:[-.05,.65],26:[.05,.65],27:[-.06,.8],28:[.06,.8]}
+  for(const [id,[dx,y]] of Object.entries(joints)) landmarks[id]={x:x+dx,y,visibility:1}
+  return {center:{x,y:.55},area:.08,landmarks}
+}
+const rqTrusted=()=>[{timestamp:0,features:rqPlayer()},{timestamp:.55,features:rqPlayer(.31)}]
+const rqNegatives=()=>[rqPlayer(.8,true)]
+const rqCandidate=(poseIndex=1,x=.6,teammate=false)=>({poseIndex,features:rqPlayer(x,teammate)})
+const rqStep=(time,candidates,hypothesis=null)=>evaluateReacquisition(rqTrusted(),rqNegatives(),time,candidates,1,hypothesis)
+const rqRun=(frames)=>{
+  const diagnostics=new Map()
+  const evidence=trackIdentity({timestamp:0,features:rqPlayer()},[
+    {frameId:'trusted',timestamp:.55,candidates:[rqCandidate(1,.31)]},
+    {frameId:'gap',timestamp:2,candidates:[]},...frames],1,(id,d)=>diagnostics.set(id,d),{competitors:rqNegatives()})
+  return {evidence,diagnostics}
+}
+test('reacquisition: no detection remains locked',()=>{
+  const r=rqStep(3,[])
+  assert.equal(r.diagnostic.code,'REACQUISITION_NO_CANDIDATE')
+  assert.equal(r.evidence.accepted,false)
+  assert.equal(r.hypothesis,null)
+})
+test('reacquisition: incompatible pose is rejected without using old position',()=>{
+  const r=rqStep(3,[rqCandidate(1,.3,true)])
+  assert.equal(r.evidence.accepted,false)
+  assert.equal(r.diagnostic.code,'REACQUISITION_REJECTED')
+  assert.ok(r.diagnostic.candidates[0].reasons.includes('REACQUISITION_TARGET_GEOMETRY'))
+})
+test('reacquisition: one compatible frame is only a pending hypothesis',()=>{
+  const r=rqStep(3,[rqCandidate()])
+  assert.equal(r.diagnostic.code,'REACQUISITION_PENDING_CONFIRMATION')
+  assert.equal(r.diagnostic.confirmation.count,1)
+  assert.equal(r.evidence.poseIndex,null)
+  assert.equal(r.evidence.observation,undefined)
+})
+test('reacquisition: three observations confirm despite changed pose indices',()=>{
+  let r=rqStep(3,[rqCandidate(7)])
+  r=rqStep(3.55,[rqCandidate(2,.61)],r.hypothesis)
+  assert.equal(r.evidence.accepted,false)
+  r=rqStep(4.10,[rqCandidate(9,.62)],r.hypothesis)
+  assert.equal(r.diagnostic.code,'REACQUISITION_CONFIRMED')
+  assert.equal(r.evidence.poseIndex,9)
+  assert.equal(r.evidence.observation.timestamp,4.1)
+  assert.equal(r.diagnostic.confirmation.count,3)
+})
+test('reacquisition: a different local trajectory resets the hypothesis',()=>{
+  const a=rqStep(3,[rqCandidate(1,.6)])
+  const b=rqStep(3.55,[rqCandidate(1,.2)],a.hypothesis)
+  assert.equal(b.diagnostic.code,'REACQUISITION_HYPOTHESIS_RESET')
+  assert.equal(b.evidence.accepted,false)
+  assert.equal(b.hypothesis,null)
+})
+test('reacquisition: similarly plausible competitors abstain and reset',()=>{
+  const a=rqStep(3,[rqCandidate()])
+  const b=rqStep(3.55,[rqCandidate(1,.61),rqCandidate(2,.8)],a.hypothesis)
+  assert.equal(b.diagnostic.code,'REACQUISITION_AMBIGUOUS')
+  assert.equal(b.diagnostic.ambiguity,true)
+  assert.equal(b.hypothesis,null)
+})
+test('reacquisition: YouTube-style only-teammate availability never suffices',()=>{
+  const frames=Array.from({length:12},(_,i)=>({frameId:'teammate'+i,timestamp:12+i*.55,candidates:[rqCandidate(i%3+1,.3,true)]}))
+  const {evidence}=rqRun(frames)
+  for(const f of frames) assert.equal(evidence.get(f.frameId).accepted,false)
+})
+test('reacquisition: indistinguishable target and teammate evidence stays locked',()=>{
+  let h=null
+  for(const t of [3,3.55,4.1,4.65]) {
+    const r=evaluateReacquisition(rqTrusted(),[rqPlayer(.8)],t,[rqCandidate()],1,h)
+    assert.equal(r.evidence.accepted,false)
+    assert.ok(r.diagnostic.candidates[0].reasons.includes('REACQUISITION_COMPETITOR_SEPARATION'))
+    h=r.hypothesis
+  }
+})
+test('reacquisition: trusted stream resumes only at confirmation; no backfill',()=>{
+  const frames=[2.55,3.10,3.65,4.20].map((timestamp,i)=>({frameId:'return'+i,timestamp,candidates:[rqCandidate(i+1,.6+i*.01)]}))
+  const {evidence,diagnostics}=rqRun(frames)
+  assert.equal(evidence.get('return0').accepted,false)
+  assert.equal(evidence.get('return1').accepted,false)
+  assert.equal(evidence.get('return2').accepted,true)
+  assert.equal(evidence.get('return3').accepted,true)
+  assert.equal(diagnostics.get('return2').continuity,'reacquired')
+  assert.equal(diagnostics.get('return3').code,'ACCEPTED_TARGET')
+  assert.equal(evidence.get('return2').observation.segment,1)
+})
+test('reacquisition: pending and rejected observations cannot authorize biomechanics',()=>{
+  const pending=rqStep(3,[rqCandidate()]).evidence
+  const rejected=rqStep(3,[rqCandidate(1,.3,true)]).evidence
+  assert.equal(identitySequenceAllowed(['a','b','c'],()=>pending),false)
+  assert.equal(identitySequenceAllowed(['a','b','c'],()=>rejected),false)
+  const result=detectPhases([pending,rejected,pending].map((e,i)=>({frameId:'p'+i,timestamp:i*.55,matched:e.accepted,targetScore:e.score,reach:2,wrist:{x:i,y:0}})))
+  assert.equal(result.proposals.length,0)
+})
+test('reacquisition: refinement cannot backfill across the untrusted gap',()=>{
+  const refs=[...rqTrusted(),{timestamp:2,features:rqPlayer(.32),segment:1}]
+  const r=refineIdentity(refs,1.1,[rqCandidate(1,.32)],1)
+  assert.equal(r.accepted,false)
+  assert.match(r.reason,/reacquisition boundary/)
+})
+test('reacquisition: opting in leaves pre-lockout decisions and diagnostics identical',()=>{
+  const anchor={timestamp:0,features:rqPlayer()}
+  const frames=Array.from({length:6},(_,i)=>({frameId:'same'+i,timestamp:(i+1)*.55,candidates:[rqCandidate(i%3+1,.3+(i+1)*.01)]}))
+  const before=[],after=[]
+  const a=trackIdentity(anchor,frames,1,(_,d)=>before.push(d))
+  const b=trackIdentity(anchor,frames,1,(_,d)=>after.push(d),{competitors:rqNegatives()})
+  assert.deepEqual(a,b)
+  assert.deepEqual(before,after)
+})
+test('reacquisition: anchor alone or absent competitor reference fails closed',()=>{
+  for(const [trusted,negatives] of [[rqTrusted().slice(0,1),rqNegatives()],[rqTrusted(),[]]]) {
+    const r=evaluateReacquisition(trusted,negatives,3,[rqCandidate()],1)
+    assert.equal(r.diagnostic.code,'REACQUISITION_NOT_ATTEMPTED_INSUFFICIENT_REFERENCE')
+    assert.equal(r.evidence.accepted,false)
+  }
+})
+test('reacquisition: poor visibility and malformed geometry cannot confirm',()=>{
+  for(const mutate of [f=>f.landmarks[11].visibility=.1,f=>f.landmarks[15].x=NaN]) {
+    const candidate=rqCandidate();mutate(candidate.features)
+    const r=rqStep(3,[candidate])
+    assert.equal(r.evidence.accepted,false)
+    assert.equal(r.diagnostic.code,'REACQUISITION_AMBIGUOUS')
+    assert.ok(r.diagnostic.candidates[0].reasons.includes('REACQUISITION_POSE_QUALITY'))
+  }
+})
+test('reacquisition: missing samples and excessive confirmation intervals reset',()=>{
+  const a=rqStep(3,[rqCandidate()])
+  assert.equal(rqStep(4,[rqCandidate()],a.hypothesis).diagnostic.code,'REACQUISITION_HYPOTHESIS_RESET')
+  assert.equal(rqStep(3.55,[],a.hypothesis).hypothesis,null)
+})
+test('reacquisition: deterministic candidate ordering and safe backward confirmation',()=>{
+  const frames=[3,2.45,1.9]
+  let a=null,b=null
+  for(const t of frames) {
+    const candidates=[rqCandidate(7),rqCandidate(4,.9,true)]
+    const x=rqStep(t,candidates,a),y=rqStep(t,candidates.slice().reverse(),b)
+    assert.deepEqual(x.evidence,y.evidence)
+    a=x.hypothesis;b=y.hypothesis
+    if(t===1.9) assert.equal(x.evidence.accepted,true)
+  }
+})
+
+test('prerequisites: insufficient target count is explicit',()=>{
+  const q=evaluateReacquisition(rqTrusted().slice(0,1),rqNegatives(),3,[rqCandidate()],1).diagnostic.prerequisites
+  assert.deepEqual(q.reasons,['INSUFFICIENT_USABLE_TARGET_REFERENCES','INSUFFICIENT_UNIQUE_TARGET_REFERENCES'])
+  assert.deepEqual(q.target,{available:1,unique:1,usable:1,required:2})
+})
+test('prerequisites: missing competitor is explicit',()=>{
+  const q=evaluateReacquisition(rqTrusted(),[],3,[rqCandidate()],1).diagnostic.prerequisites
+  assert.deepEqual(q.reasons,['INSUFFICIENT_COMPETITOR_REFERENCES'])
+  assert.equal(q.competitor.available,0)
+  assert.equal(q.competitor.required,1)
+})
+test('prerequisites: simultaneous failures are preserved',()=>{
+  const q=evaluateReacquisition([],[],NaN,[rqCandidate()],1).diagnostic.prerequisites
+  assert.deepEqual(q.reasons,['INVALID_REACQUISITION_TIMESTAMP','INSUFFICIENT_USABLE_TARGET_REFERENCES','INSUFFICIENT_UNIQUE_TARGET_REFERENCES','INSUFFICIENT_COMPETITOR_REFERENCES'])
+})
+test('prerequisites: sufficient references remain eligible and pending',()=>{
+  const r=rqStep(3,[rqCandidate()])
+  assert.equal(r.diagnostic.prerequisites.eligible,true)
+  assert.deepEqual(r.diagnostic.prerequisites.reasons,[])
+  assert.equal(r.diagnostic.code,'REACQUISITION_PENDING_CONFIRMATION')
+})
+test('prerequisites: counts reflect deduplication and unusable geometry',()=>{
+  const refs=rqTrusted();refs[1].features.landmarks[15].visibility=.2
+  const q=evaluateReacquisition([...refs,refs[0]],rqNegatives(),3,[rqCandidate()],1).diagnostic.prerequisites
+  assert.deepEqual(q.target,{available:3,unique:2,usable:1,required:2})
+  assert.ok(q.reasons.includes('TARGET_REFERENCES_UNUSABLE'))
+  assert.deepEqual(q.references[1].reasons,['LANDMARK_15_INSUFFICIENT_VISIBILITY'])
+})
+test('prerequisites: every competitor must be usable; all quality failures exposed',()=>{
+  const bad=rqPlayer();bad.area=0;bad.landmarks[11].x=NaN;bad.landmarks[12].visibility=.1
+  const q=evaluateReacquisition(rqTrusted(),[...rqNegatives(),bad],3,[rqCandidate()],1).diagnostic.prerequisites
+  assert.deepEqual(q.competitor,{available:2,usable:1,required:1,allUsable:false})
+  assert.deepEqual(q.reasons,['COMPETITOR_REFERENCES_UNUSABLE'])
+  assert.deepEqual(q.references.at(-1).reasons,['INVALID_AREA','LANDMARK_11_INVALID_COORDINATES','LANDMARK_12_INSUFFICIENT_VISIBILITY'])
+})
+test('prerequisites: unused bad target reference does not block sufficient good references',()=>{
+  const bad=rqPlayer();bad.area=0
+  const r=evaluateReacquisition([...rqTrusted(),{timestamp:1,features:bad}],rqNegatives(),3,[rqCandidate()],1)
+  assert.equal(r.diagnostic.prerequisites.eligible,true)
+  assert.equal(r.diagnostic.prerequisites.target.usable,2)
+  assert.equal(r.diagnostic.code,'REACQUISITION_PENDING_CONFIRMATION')
+})
+test('prerequisites: no-candidate precedence remains unchanged',()=>{
+  const r=evaluateReacquisition([],[],NaN,[],0)
+  assert.equal(r.diagnostic.code,'REACQUISITION_NO_CANDIDATE')
+  assert.equal(r.diagnostic.prerequisites,undefined)
+})
+test('prerequisites: degenerate torso and limb report their actual failure',()=>{
+  for(const [mutate,reason] of [
+    [f=>{f.landmarks[23]={...f.landmarks[11]};f.landmarks[24]={...f.landmarks[12]}},'TORSO_TOO_SHORT'],
+    [f=>{f.landmarks[13]={...f.landmarks[11]}},'LIMB_11_13_TOO_SHORT'],
+  ]) {
+    const bad=rqPlayer();mutate(bad)
+    const q=evaluateReacquisition(rqTrusted(),[bad],3,[rqCandidate()],1).diagnostic.prerequisites
+    assert.deepEqual(q.references.at(-1).reasons,[reason])
+    assert.equal(q.eligible,false)
+  }
+})

@@ -23,16 +23,139 @@ export function planCoarseSampling(duration: number) {
 export type Landmark = { x: number; y: number; visibility?: number }
 export type PlayerFeatures = { center: { x: number; y: number }; area: number; landmarks: Landmark[] }
 
-export type IdentityObservation = { timestamp: number; features: PlayerFeatures }
+export type IdentityObservation = { timestamp: number; features: PlayerFeatures; segment?: number }
 export type IdentityEvidence = { accepted: boolean; poseIndex: number | null; score: number; reason: string; observation?: IdentityObservation }
 export type IdentityCandidate = { poseIndex: number; features: PlayerFeatures }
 // Development-only observations; callbacks never participate in decisions.
 export type IdentityDiagnostic = {
-  code: string; continuity: 'tracking' | 'locked'; ambiguity: boolean
+  code: string; continuity: 'tracking' | 'locked' | 'reacquisition_candidate' | 'reacquired'; ambiguity: boolean
   evaluated: number; plausible: number
-  candidates: Array<{ poseIndex: number; plausible: boolean; reasons: string[] }>
+  candidates: Array<{ poseIndex: number; plausible: boolean; reasons: string[]; targetDistance?: number; competitorDistance?: number }>
+  confirmation?: { count: number; required: number; poseIndex: number | null }
+  prerequisites?: {
+    eligible: boolean; timestampFinite: boolean; reasons: string[]
+    target: { available: number; unique: number; usable: number; required: number }
+    competitor: { available: number; usable: number; required: number; allUsable: boolean }
+    references: Array<{ kind: 'target' | 'competitor'; index: number; timestamp?: number; usable: boolean; reasons: string[] }>
+  }
 }
 export type IdentityObserver = (diagnostic: IdentityDiagnostic) => void
+export type ReacquisitionContext = { competitors: PlayerFeatures[] }
+export type ReacquisitionHypothesis = { observations: IdentityObservation[] }
+
+// Pose configuration only: unit limb directions relative to the torso, without
+// face landmarks, limb-length signatures, appearance, or stale absolute position.
+function reacquisitionGeometry(features: PlayerFeatures, aspect: number, issues?: string[]): number[] | null {
+  const ids = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
+  if (!Number.isFinite(aspect) || aspect <= 0 || !Number.isFinite(features.area) || features.area <= 0
+    || !Number.isFinite(features.center.x) || !Number.isFinite(features.center.y)
+    || !ids.every((i) => { const p = features.landmarks[i]; return p && Number.isFinite(p.x) && Number.isFinite(p.y) && (p.visibility ?? 0) >= 0.75 })) {
+    if (!Number.isFinite(aspect) || aspect <= 0) issues?.push('INVALID_ASPECT')
+    if (!Number.isFinite(features.area) || features.area <= 0) issues?.push('INVALID_AREA')
+    if (!Number.isFinite(features.center.x) || !Number.isFinite(features.center.y)) issues?.push('INVALID_CENTER')
+    for (const i of ids) {
+      const p = features.landmarks[i]
+      if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) issues?.push(`LANDMARK_${i}_INVALID_COORDINATES`)
+      if (!p || !((p.visibility ?? 0) >= 0.75)) issues?.push(`LANDMARK_${i}_INSUFFICIENT_VISIBILITY`)
+    }
+    return null
+  }
+  const point = (i: number) => ({ x: features.landmarks[i].x * aspect, y: features.landmarks[i].y })
+  const a = point(11), b = point(12), c = point(23), d = point(24)
+  const tx = (a.x + b.x - c.x - d.x) / 2, ty = (a.y + b.y - c.y - d.y) / 2
+  const torso = Math.hypot(tx, ty)
+  if (torso < 0.02) { issues?.push('TORSO_TOO_SHORT'); return null }
+  const values: number[] = []
+  for (const [i, j] of [[11, 13], [13, 15], [12, 14], [14, 16], [23, 25], [25, 27], [24, 26], [26, 28]]) {
+    const p = point(i), q = point(j), x = q.x - p.x, y = q.y - p.y, length = Math.hypot(x, y)
+    if (length < 0.01) { issues?.push(`LIMB_${i}_${j}_TOO_SHORT`); return null }
+    values.push((x * tx + y * ty) / (length * torso), (x * ty - y * tx) / (length * torso))
+  }
+  return values
+}
+
+// New reacquisition gates, not replacements for continuous identity thresholds.
+// Three observations at the 0.55s cadence span about 1.1s; never bridge a missing
+// confirmation sample beyond the existing 0.8s motion-neighbor limit.
+export function evaluateReacquisition(trusted: IdentityObservation[], competitors: PlayerFeatures[], timestamp: number,
+  candidates: IdentityCandidate[], aspect: number, hypothesis: ReacquisitionHypothesis | null = null) {
+  const diagnostic: IdentityDiagnostic = { code: '', continuity: 'locked', ambiguity: false, evaluated: 0, plausible: 0, candidates: [], confirmation: { count: 0, required: 3, poseIndex: null } }
+  const finish = (code: string, next: ReacquisitionHypothesis | null = null, winner?: IdentityCandidate) => {
+    diagnostic.code = code
+    diagnostic.continuity = winner ? 'reacquired' : next ? 'reacquisition_candidate' : 'locked'
+    diagnostic.confirmation = { count: next?.observations.length ?? 0, required: 3, poseIndex: winner?.poseIndex ?? (next ? candidates.find((c) => c.features === next.observations[next.observations.length - 1].features)?.poseIndex ?? null : null) }
+    const evidence: IdentityEvidence = winner
+      ? { accepted: true, poseIndex: winner.poseIndex, score: 1 - (diagnostic.candidates.find((c) => c.poseIndex === winner.poseIndex)?.targetDistance ?? 1), reason: code, observation: { timestamp, features: winner.features } }
+      : { accepted: false, poseIndex: null, score: 0, reason: code }
+    return { evidence, diagnostic, hypothesis: winner ? null : next }
+  }
+  if (!candidates.length) return finish('REACQUISITION_NO_CANDIDATE')
+  const audits: NonNullable<IdentityDiagnostic['prerequisites']>['references'] = []
+  const unique = trusted.filter((r, i) => trusted.findIndex((s) => s.timestamp === r.timestamp) === i)
+  const references = unique.map((r, index) => {
+    const reasons: string[] = []
+    const geometry = reacquisitionGeometry(r.features, aspect, reasons)
+    audits.push({ kind: 'target', index, timestamp: r.timestamp, usable: geometry !== null, reasons })
+    return geometry
+  }).filter((r): r is number[] => r !== null)
+  const negatives = competitors.map((f, index) => {
+    const reasons: string[] = []
+    const geometry = reacquisitionGeometry(f, aspect, reasons)
+    audits.push({ kind: 'competitor', index, usable: geometry !== null, reasons })
+    return geometry
+  })
+  // Observational only; retain the original authoritative eligibility gate below.
+  const reasons: string[] = []
+  if (!Number.isFinite(timestamp)) reasons.push('INVALID_REACQUISITION_TIMESTAMP')
+  if (references.length < 2) {
+    reasons.push('INSUFFICIENT_USABLE_TARGET_REFERENCES')
+    if (unique.length < 2) reasons.push('INSUFFICIENT_UNIQUE_TARGET_REFERENCES')
+    if (references.length < unique.length) reasons.push('TARGET_REFERENCES_UNUSABLE')
+  }
+  if (!negatives.length) reasons.push('INSUFFICIENT_COMPETITOR_REFERENCES')
+  if (negatives.some((r) => r === null)) reasons.push('COMPETITOR_REFERENCES_UNUSABLE')
+  diagnostic.prerequisites = {
+    eligible: reasons.length === 0, timestampFinite: Number.isFinite(timestamp), reasons,
+    target: { available: trusted.length, unique: unique.length, usable: references.length, required: 2 },
+    competitor: { available: negatives.length, usable: negatives.filter((r) => r !== null).length,
+      required: 1, allUsable: negatives.every((r) => r !== null) },
+    references: audits,
+  }
+  // An anchor alone or incomplete competitor evidence cannot establish identity.
+  if (!Number.isFinite(timestamp) || references.length < 2 || !negatives.length || negatives.some((r) => r === null)) return finish('REACQUISITION_NOT_ATTEMPTED_INSUFFICIENT_REFERENCE')
+  const distance = (a: number[], b: number[]) => Math.sqrt(a.reduce((sum, v, i) => sum + (v - b[i]) ** 2, 0) / a.length)
+  const plausible: IdentityCandidate[] = []
+  let unknownCompetitor = false
+  for (const candidate of candidates) {
+    const geometry = reacquisitionGeometry(candidate.features, aspect)
+    const reasons: string[] = []
+    let targetDistance: number | undefined, competitorDistance: number | undefined
+    if (!geometry) { reasons.push('REACQUISITION_POSE_QUALITY'); unknownCompetitor = true }
+    else {
+      targetDistance = Math.min(...references.map((r) => distance(geometry, r)))
+      competitorDistance = Math.min(...negatives.map((r) => distance(geometry, r!)))
+      if (targetDistance > 0.08) reasons.push('REACQUISITION_TARGET_GEOMETRY')
+      if (competitorDistance - targetDistance < 0.12) reasons.push('REACQUISITION_COMPETITOR_SEPARATION')
+      if (!reasons.length) plausible.push(candidate)
+    }
+    diagnostic.candidates.push({ poseIndex: candidate.poseIndex, plausible: !reasons.length, reasons, targetDistance, competitorDistance })
+  }
+  diagnostic.evaluated = candidates.length
+  diagnostic.plausible = plausible.length
+  if (plausible.length > 1 || unknownCompetitor) { diagnostic.ambiguity = true; return finish('REACQUISITION_AMBIGUOUS') }
+  if (plausible.length !== 1) return finish('REACQUISITION_REJECTED')
+  const winner = plausible[0]
+  if (hypothesis) {
+    const observations = hypothesis.observations
+    const dt = timestamp - observations[observations.length - 1].timestamp
+    const previousDt = observations.length > 1 ? observations[observations.length - 1].timestamp - observations[observations.length - 2].timestamp : dt
+    // Fresh local continuity is only confirmation, never the identity evidence.
+    const step = identityStep(observations, timestamp, candidates, aspect)
+    if (Math.abs(dt) > 0.8 || dt * previousDt <= 0 || !step.accepted || step.poseIndex !== winner.poseIndex) return finish('REACQUISITION_HYPOTHESIS_RESET')
+  }
+  const next = { observations: [...(hypothesis?.observations ?? []), { timestamp, features: winner.features }] }
+  return finish(next.observations.length >= 3 ? 'REACQUISITION_CONFIRMED' : 'REACQUISITION_PENDING_CONFIRMATION', next, next.observations.length >= 3 ? winner : undefined)
+}
 // Geometric continuity is evidence, not recognition. Never restart from the old
 // anchor after a crossing or long gap: similar teammates cannot be distinguished.
 export function identityStep(history: IdentityObservation[], timestamp: number, candidates: IdentityCandidate[], aspect: number, observe?: IdentityObserver): IdentityEvidence {
@@ -79,18 +202,37 @@ export function identityStep(history: IdentityObservation[], timestamp: number, 
   return { accepted: true, poseIndex: winner.poseIndex, score: match.score, reason: 'Unique short-gap trajectory, compatible scale and visible torso', observation: { timestamp, features: winner.features } }
 }
 
-export function trackIdentity(anchor: IdentityObservation, frames: Array<{ frameId: string; timestamp: number; candidates: IdentityCandidate[] }>, aspect: number, observe?: (frameId: string, diagnostic: IdentityDiagnostic) => void) {
+export function trackIdentity(anchor: IdentityObservation, frames: Array<{ frameId: string; timestamp: number; candidates: IdentityCandidate[] }>, aspect: number, observe?: (frameId: string, diagnostic: IdentityDiagnostic) => void, reacquisition?: ReacquisitionContext) {
   const evidence = new Map<string, IdentityEvidence>()
   for (const direction of [-1, 1]) {
     const history = [anchor]
     let locked = false
+    let hypothesis: ReacquisitionHypothesis | null = null
+    let segment = 0
+    const competitors = [...(reacquisition?.competitors ?? [])]
     const ordered = frames.filter((f) => (f.timestamp - anchor.timestamp) * direction > 0.000001)
       .sort((a, b) => direction * (a.timestamp - b.timestamp) || a.frameId.localeCompare(b.frameId))
     for (const frame of ordered) {
+      if (locked && reacquisition) {
+        const attempt = evaluateReacquisition(history, competitors, frame.timestamp, frame.candidates, aspect, hypothesis)
+        hypothesis = attempt.hypothesis
+        observe?.(frame.frameId, attempt.diagnostic)
+        if (attempt.evidence.observation) {
+          // Do not backfill hypotheses or carry stale velocity across the gap.
+          segment += direction
+          attempt.evidence.observation.segment = segment
+          history.splice(0, history.length, attempt.evidence.observation)
+          locked = false
+        }
+        evidence.set(frame.frameId, attempt.evidence)
+        continue
+      }
       if (locked) observe?.(frame.frameId, { code: 'CONTINUITY_LOCKED', continuity: 'locked', ambiguity: false, evaluated: 0, plausible: 0, candidates: [] })
       const result = locked ? { accepted: false, poseIndex: null, score: 0, reason: 'Identity continuity lost; manual re-anchor required' } : identityStep(history, frame.timestamp, frame.candidates, aspect, (d) => observe?.(frame.frameId, d))
       evidence.set(frame.frameId, result)
+      if (result.observation && segment !== 0) result.observation.segment = segment
       if (result.observation) history.push(result.observation)
+      if (reacquisition && result.accepted) competitors.push(...frame.candidates.filter((c) => c.poseIndex !== result.poseIndex).map((c) => c.features))
       if (result.reason.includes('manual re-anchor')) locked = true
     }
   }
@@ -101,10 +243,12 @@ export function trackIdentity(anchor: IdentityObservation, frames: Array<{ frame
 export function refineIdentity(references: IdentityObservation[], timestamp: number, candidates: IdentityCandidate[], aspect: number): IdentityEvidence {
   const before = references.filter((r) => r.timestamp < timestamp).sort((a, b) => a.timestamp - b.timestamp)
   const after = references.filter((r) => r.timestamp > timestamp).sort((a, b) => b.timestamp - a.timestamp)
-  const a = identityStep(before.slice(-2), timestamp, candidates, aspect)
-  const b = identityStep(after.slice(-2), timestamp, candidates, aspect)
+  const segment = before[before.length - 1]?.segment ?? 0
+  if (segment !== (after[after.length - 1]?.segment ?? 0)) return { accepted: false, poseIndex: null, score: 0, reason: 'Refinement cannot bridge a reacquisition boundary' }
+  const a = identityStep(before.filter((r) => (r.segment ?? 0) === segment).slice(-2), timestamp, candidates, aspect)
+  const b = identityStep(after.filter((r) => (r.segment ?? 0) === segment).slice(-2), timestamp, candidates, aspect)
   if (!a.accepted || !b.accepted || a.poseIndex !== b.poseIndex) return { accepted: false, poseIndex: null, score: 0, reason: 'Refinement lacks agreeing identity continuity on both sides' }
-  return { ...a, reason: 'Identity supported by trusted observations before and after' }
+  return { ...a, ...(a.observation && segment !== 0 ? { observation: { ...a.observation, segment } } : {}), reason: 'Identity supported by trusted observations before and after' }
 }
 
 // Shared by phase acceptance and automatic biomechanics: absence fails closed.
