@@ -706,7 +706,7 @@ test('ledger: confirmed target retained but pending history and confirmation neg
 })
 test('checkpoint equivalence: tracking lock reacquisition and phases unchanged',()=>{
   const {execFileSync}=require('node:child_process')
-  const source=execFileSync('git',['show','6ca012b3fa30f908662a3be6a1694061c003bb96:src/lib/phase-detection.ts'],{encoding:'utf8'})
+  const source=execFileSync('git',['show','38284e52a6adcfbe7d17019a9b752156e47b22de:src/lib/phase-detection.ts'],{encoding:'utf8'})
   const baseline=new Module(filename,module)
   baseline._compile(ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText,filename)
   const frames=[{frameId:'trusted',timestamp:.55,candidates:[rqCandidate(1,.31)]},{frameId:'gap',timestamp:2,candidates:[]},
@@ -843,4 +843,158 @@ test('acquisition: base checkpoint decisions and downstream code remain unchange
   const page=fs.readFileSync(path.resolve(__dirname,'../src/app/pose-test/page.tsx'),'utf8')
   const handler=page.slice(page.indexOf('  const runTargetAcquisition'),page.indexOf('  const acceptAutomaticPhases'))
   for(const forbidden of ['autoCache.current.set','trackIdentity(','evaluateReacquisition(','setReferenceLedger(','setRefinedFrames(','setAnalyses(','localStorage']) assert.equal(handler.includes(forbidden),false)
+})
+
+const { buildCompetitorProvenance } = mod.exports
+function cpFrame(timestamp, xs=[.2], options={}) {
+  const features=rqPlayer(.95)
+  return {frameId:'cp-'+timestamp,timestamp,direction:'forward',origin:'coarse',diagnosticCode:'ACCEPTED_TARGET',
+    evidence:{accepted:true,poseIndex:99,score:1,reason:'ACCEPTED_TARGET',observation:{timestamp,features,segment:0}},
+    candidates:[{poseIndex:99,features},...xs.map((x,i)=>({poseIndex:i+1,features:rqPlayer(x),detectionSource:'FULL_FRAME'}))],...options}
+}
+const cp=(frames)=>buildCompetitorProvenance('video','run',0,1,frames)
+function cpDecision(t=2.2) {
+  return cpFrame(t,[],{diagnosticCode:'REACQUISITION_NOT_ATTEMPTED_INSUFFICIENT_REFERENCE',
+    evidence:{accepted:false,poseIndex:null,score:0,reason:'insufficient'}})
+}
+function cpPoor(f,index=1) {f.candidates[index].features.landmarks[15].visibility=.2; return f}
+const cpSemantics=(r)=>r.observations.map(o=>({segment:o.segmentId,status:o.association,time:o.reference.timestamp,reason:o.reason}))
+test('competitor: smooth nearby observations form one local segment',()=>{
+  const r=cp([cpFrame(0),cpFrame(.55,[.21]),cpFrame(1.1,[.22])])
+  assert.equal(r.segments.length,1)
+  assert.deepEqual(r.observations.map(o=>o.association),['new-local-segment','locally-associated','locally-associated'])
+})
+test('competitor: pose-index permutation cannot change continuity',()=>{
+  const a=[cpFrame(0),cpFrame(.55,[.21])]
+  const b=structuredClone(a); b[1].candidates[1].poseIndex=8
+  assert.deepEqual(cpSemantics(cp(a)),cpSemantics(cp(b)))
+})
+test('competitor: candidate-order permutation cannot change continuity',()=>{
+  const a=[cpFrame(0,[.2,.6]),cpFrame(.55,[.21,.61])]
+  const b=structuredClone(a); b.forEach(f=>f.candidates.reverse())
+  assert.deepEqual(cp(a),cp(b))
+})
+test('competitor: two distinct trajectories remain separate',()=>{
+  const r=cp([cpFrame(0,[.2,.6]),cpFrame(.55,[.21,.61]),cpFrame(1.1,[.22,.62])])
+  assert.equal(r.segments.length,2); assert.ok(r.segments.every(s=>s.observations.length===3))
+})
+test('competitor: one previous segment cannot claim two candidates',()=>{
+  const r=cp([cpFrame(0),cpFrame(.55,[.205,.21])])
+  assert.ok(r.observations.slice(1).every(o=>o.association==='unresolved'))
+  assert.equal(r.segments[0].termination.reason,'COMPETING_ASSIGNMENTS')
+})
+test('competitor: one candidate cannot satisfy two previous segments',()=>{
+  const r=cp([cpFrame(0,[.2,.24]),cpFrame(.55,[.22])])
+  assert.equal(r.observations[2].association,'unresolved')
+  assert.ok(r.segments.every(s=>s.observations.length===1))
+})
+test('competitor: ambiguous crossing terminates and does not reconnect',()=>{
+  const r=cp([cpFrame(0,[.2,.3]),cpFrame(.55,[.24,.26]),cpFrame(1.1,[.2,.3])])
+  assert.ok(r.observations.slice(2,4).every(o=>o.association==='unresolved'))
+  assert.ok(r.observations.slice(4).every(o=>o.association==='new-local-segment'))
+  assert.notEqual(r.observations[0].segmentId,r.observations[4].segmentId)
+})
+test('competitor: unsupported temporal gap starts a separate segment',()=>{
+  const r=cp([cpFrame(0),cpFrame(1.3)])
+  assert.equal(r.segments.length,2); assert.equal(r.segments[0].termination.reason,'UNSUPPORTED_TEMPORAL_GAP')
+})
+for(const code of ['CONTINUITY_LOCKED','REACQUISITION_PENDING_CONFIRMATION','REACQUISITION_CONFIRMED','MANUAL_REANCHOR']) {
+  test('competitor: explicit TARGET_A boundary blocks continuity: '+code,()=>{
+    const r=cp([cpFrame(0),cpFrame(.3,[.2],{diagnosticCode:code}),cpFrame(.55)])
+    assert.equal(r.observations.length,2); assert.equal(r.segments.length,2)
+    assert.equal(r.segments[0].termination.reason,'TARGET_TRUST_BOUNDARY:'+code)
+  })
+}
+test('competitor: accepted manual re-anchor still terminates continuity',()=>{
+  const r=cp([cpFrame(0),cpFrame(.55,[.2],{origin:'manual-anchor',diagnosticCode:'USER_SELECTED_ANCHOR'})])
+  assert.equal(r.segments.length,2); assert.equal(r.segments[0].termination.reason,'MANUAL_REANCHOR_BOUNDARY')
+})
+test('competitor: camera pan cannot force simultaneous displaced association',()=>{
+  const r=cp([cpFrame(0,[.1,.4]),cpFrame(.55,[.5,.8])])
+  assert.ok(r.observations.slice(2).every(o=>o.association!=='locally-associated'))
+})
+test('competitor: missed detection terminates immediately',()=>{
+  const r=cp([cpFrame(0),cpFrame(.55,[]),cpFrame(1.1)])
+  assert.equal(r.segments.length,2); assert.equal(r.segments[0].termination.reason,'MISSED_DETECTION')
+})
+test('competitor: later similar return cannot reconnect a terminated segment',()=>{
+  const r=cp([cpFrame(0),cpFrame(.55,[.7]),cpFrame(1.1,[.2])])
+  assert.equal(r.segments.length,3)
+  assert.notEqual(r.observations[0].segmentId,r.observations[2].segmentId)
+})
+test('competitor: local continuity and full geometry quality remain separate',()=>{
+  const r=cp([cpFrame(0),cpPoor(cpFrame(.55,[.21]))])
+  assert.equal(r.observations[1].association,'locally-associated')
+  assert.equal(r.observations[1].reference.qualification,'unusable')
+  assert.deepEqual(r.observations[1].reference.qualityFailures,['LANDMARK_15_INSUFFICIENT_VISIBILITY'])
+})
+test('competitor: qualified geometry does not resolve competing identity',()=>{
+  const r=cp([cpFrame(0,[.2,.24]),cpFrame(.55,[.22])])
+  assert.equal(r.observations[2].reference.qualification,'qualified')
+  assert.equal(r.observations[2].association,'unresolved')
+  assert.equal(r.unresolvedObligations.length,1)
+})
+test('competitor: later qualified observation gives only a causal shadow coverage path',()=>{
+  const r=cp([cpPoor(cpFrame(0)),cpFrame(.55,[.21]),cpDecision()])
+  assert.equal(r.coverage[0].status,'potential-shadow-coverage')
+  assert.deepEqual(r.coverage[0].path,r.segments[0].observations)
+  assert.equal(r.observations[0].reference.qualification,'unusable')
+})
+test('competitor: unresolved observation cannot be covered by another segment',()=>{
+  const r=cp([cpFrame(0,[.2,.24]),cpPoor(cpFrame(.55,[.22])),cpFrame(1.1,[.22]),cpDecision()])
+  assert.equal(r.coverage[0].reason,'UNRESOLVED_COMPETITOR_IDENTITY')
+  assert.equal(r.coverage[0].coveringObservation,null)
+})
+test('competitor: qualified far player cannot cover another unusable track',()=>{
+  const r=cp([cpPoor(cpFrame(0,[.2,.7])),cpPoor(cpFrame(.55,[.21,.71])),cpDecision()])
+  assert.ok(r.coverage.every(c=>c.status==='unresolved'))
+})
+test('competitor: crop source is provenance, never identity evidence',()=>{
+  const a=cpFrame(0),b=cpFrame(.55,[.21]); b.candidates[1].detectionSource='RIGHT_CROP'
+  const r=cp([a,b]); assert.equal(r.segments.length,1)
+  assert.equal(r.observations[1].reference.detectionSource,'RIGHT_CROP')
+  const c=cpFrame(1.1,[.8]);c.candidates[1].detectionSource='RIGHT_CROP'
+  assert.equal(cp([a,b,c]).segments.length,2)
+})
+test('competitor: duplicate candidate provenance does not create duplicate identities',()=>{
+  const f=cpFrame(0);f.candidates.push(f.candidates[1])
+  const r=cp([f]); assert.equal(r.observations.length,1); assert.equal(r.segments.length,0)
+})
+test('competitor: shadow coverage cannot change authoritative reference eligibility',()=>{
+  const bad=rqNegatives();bad[0].landmarks[15].visibility=.2
+  const before=evaluateReacquisition(rqTrusted(),bad,3,[rqCandidate()],1)
+  cp([cpPoor(cpFrame(0)),cpFrame(.55),cpDecision()])
+  assert.deepEqual(evaluateReacquisition(rqTrusted(),bad,3,[rqCandidate()],1),before)
+  assert.equal(before.diagnostic.code,'REACQUISITION_NOT_ATTEMPTED_INSUFFICIENT_REFERENCE')
+})
+test('competitor: harvested shadow target cannot extend or interrupt collection support',()=>{
+  const a=cpFrame(0),b=cpFrame(.55,[.21])
+  const expected=cp([a,b]),actual=cp([a,cpFrame(.2,[.7],{origin:'dense'}),b])
+  assert.deepEqual(actual.observations,expected.observations)
+  assert.deepEqual(actual.segments,expected.segments)
+  assert.equal(actual.exclusions[0].reason,'SHADOW_TARGET_NOT_SUPPORT')
+})
+test('competitor: future qualified data cannot cover an earlier decision',()=>{
+  const r=cp([cpPoor(cpFrame(0)),cpDecision(.3),cpFrame(.55)])
+  assert.equal(r.coverage[0].status,'unresolved')
+})
+test('competitor: missing decision bound keeps coverage unresolved',()=>{
+  assert.equal(cp([cpPoor(cpFrame(0)),cpFrame(.55)]).coverage[0].reason,'NO_CAUSAL_DECISION_BOUND')
+})
+test('competitor: backward causal coverage and directional boundary remain explicit',()=>{
+  const a=cpPoor(cpFrame(2,[.2],{direction:'backward'})),b=cpFrame(1.45,[.21],{direction:'backward'})
+  const decision=cpDecision(.3);decision.direction='backward'
+  const r=buildCompetitorProvenance('video','run',3,1,[b,decision,a])
+  assert.equal(r.coverage[0].status,'potential-shadow-coverage')
+  assert.equal(r.coverage[0].decisionTimestamp,.3)
+  assert.equal(r.segments.length,1)
+})
+test('competitor: authoritative library and acquisition handler unchanged against 3.0.11b',()=>{
+  const {execFileSync}=require('node:child_process')
+  const base='38284e52a6adcfbe7d17019a9b752156e47b22de'
+  const read=file=>execFileSync('git',['show',base+':'+file],{encoding:'utf8'}).replace(/\r\n/g,'\n')
+  assert.ok(fs.readFileSync(filename,'utf8').replace(/\r\n/g,'\n').startsWith(read('src/lib/phase-detection.ts').trimEnd()))
+  const before=read('src/app/pose-test/page.tsx'),after=fs.readFileSync(path.resolve(__dirname,'../src/app/pose-test/page.tsx'),'utf8').replace(/\r\n/g,'\n')
+  const handler=s=>s.slice(s.indexOf('  const runTargetAcquisition'),s.indexOf('  const acceptAutomaticPhases'))
+  assert.equal(handler(after),handler(before))
 })

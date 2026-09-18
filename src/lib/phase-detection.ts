@@ -667,3 +667,144 @@ export function relatedAcquiredTargets(observations: AcquiredTarget[]) {
     geometryDistance: Math.sqrt(a.geometry!.reduce((sum, v, j) => sum + (v - b.geometry![j]) ** 2, 0) / a.geometry!.length),
   })))
 }
+
+// Local competitor continuity is diagnostic only, never persistent identity.
+export type CompetitorProvenanceFrame = ReferenceLedgerFrame & {
+  diagnosticCode: string; origin: 'coarse' | 'manual-anchor' | 'dense'
+  direction: 'anchor' | 'forward' | 'backward'
+}
+export type CompetitorObservation = {
+  reference: ReferenceObservation; segmentId: string | null
+  association: 'locally-associated' | 'new-local-segment' | 'unresolved'
+  reason: string; predecessor: string | null
+  evidence: Array<{ segmentId: string; accepted: boolean; reason: string; score: number; checks: string[] }>
+}
+export type CompetitorSegment = {
+  id: string; observations: string[]
+  termination: { frameId: string | null; reason: string }
+}
+export function buildCompetitorProvenance(videoId: string | null, runId: string | null, anchorTime: number,
+  aspect: number, frames: CompetitorProvenanceFrame[]) {
+  const observations: CompetitorObservation[] = [], segments: CompetitorSegment[] = []
+  const exclusions: Array<{ frameId: string; reason: string }> = []
+  type Track = { segment: CompetitorSegment; history: IdentityObservation[] }
+  let active: Track[] = [], previous: CompetitorProvenanceFrame | null = null
+  const stop = (frameId: string, reason: string) => {
+    active.forEach((t) => { t.segment.termination = { frameId, reason } })
+    active = []
+  }
+  const idCount = new Map<string, number>(), timeCount = new Map<number, number>()
+  frames.forEach((f) => {
+    if (f.origin === 'dense') return
+    idCount.set(f.frameId, (idCount.get(f.frameId) ?? 0) + 1)
+    timeCount.set(f.timestamp, (timeCount.get(f.timestamp) ?? 0) + 1)
+  })
+  // Keep directional streams separate. The anchor seeds forward provenance only;
+  // backward observations form their own segments, without duplicating the anchor.
+  const ordered = [...frames].sort((a, b) => {
+    const ad = a.direction === 'backward', bd = b.direction === 'backward'
+    return Number(ad) - Number(bd) || (ad ? b.timestamp - a.timestamp : a.timestamp - b.timestamp) || a.frameId.localeCompare(b.frameId)
+  })
+  for (const frame of ordered) {
+    if (frame.origin === 'dense') { exclusions.push({ frameId: frame.frameId, reason: 'SHADOW_TARGET_NOT_SUPPORT' }); continue }
+    const trusted = frame.evidence.accepted && frame.evidence.poseIndex !== null && !!frame.evidence.observation
+      && frame.evidence.observation.timestamp === frame.timestamp
+      && ((frame.origin === 'coarse' && frame.diagnosticCode === 'ACCEPTED_TARGET')
+        || (frame.origin === 'manual-anchor' && frame.diagnosticCode === 'USER_SELECTED_ANCHOR'))
+    if (!trusted || !Number.isFinite(frame.timestamp) || idCount.get(frame.frameId)! > 1 || timeCount.get(frame.timestamp)! > 1) {
+      const reason = !trusted ? 'TARGET_TRUST_BOUNDARY:' + frame.diagnosticCode : 'INVALID_OR_DUPLICATE_PROVENANCE'
+      stop(frame.frameId, reason); exclusions.push({ frameId: frame.frameId, reason }); previous = null
+      continue
+    }
+    if (previous) {
+      const dt = Math.abs(frame.timestamp - previous.timestamp)
+      if (frame.origin === 'manual-anchor') stop(frame.frameId, 'MANUAL_REANCHOR_BOUNDARY')
+      else if ((frame.evidence.observation!.segment ?? 0) !== (previous.evidence.observation!.segment ?? 0)) stop(frame.frameId, 'TARGET_SEGMENT_BOUNDARY')
+      else if ((frame.direction === 'backward') !== (previous.direction === 'backward')) stop(frame.frameId, 'DIRECTION_BOUNDARY')
+      else if (dt > 1.2 || dt < 0.000001) stop(frame.frameId, 'UNSUPPORTED_TEMPORAL_GAP')
+    }
+    const candidates = frame.candidates.filter((c) => c.poseIndex !== frame.evidence.poseIndex)
+    // Existing detection has already deduplicated crop/full-frame candidates.
+    // Duplicate frame-local identifiers are malformed provenance, not extra people.
+    const duplicateIds = candidates.some((c, i) => candidates.findIndex((other) => other.poseIndex === c.poseIndex) !== i)
+    const rows = buildReferenceLedger(videoId, runId, anchorTime, aspect, [frame]).records.filter((r) => r.role === 'competitor')
+    const byId = new Map(rows.map((r) => [r.candidateId, r]))
+    // Geometry-derived ordering stabilizes local IDs under candidate/pose-index permutation.
+    const sorted = [...candidates].sort((a, b) => a.features.center.x - b.features.center.x
+      || a.features.center.y - b.features.center.y || a.features.area - b.features.area
+      || JSON.stringify(a.features.landmarks).localeCompare(JSON.stringify(b.features.landmarks)))
+    const edges = active.map((track) => sorted.map((candidate) => {
+      let diagnostic: IdentityDiagnostic | undefined
+      const result = identityStep(track.history, frame.timestamp, [candidate], aspect, (d) => { diagnostic = d })
+      return { segmentId: track.segment.id, accepted: result.accepted, reason: result.reason, score: result.score,
+        checks: diagnostic?.candidates.flatMap((c) => c.reasons) ?? [] }
+    }))
+    const outDegree = edges.map((row) => row.filter((e) => e.accepted).length)
+    const inDegree = sorted.map((_, j) => edges.filter((row) => row[j].accepted).length)
+    const next: Track[] = []
+    const continued = new Set<string>()
+    const emitted = new Set<number>()
+    sorted.forEach((candidate, j) => {
+      if (emitted.has(candidate.poseIndex)) return
+      emitted.add(candidate.poseIndex)
+      const reference = byId.get(frame.frameId + ':' + candidate.poseIndex)!
+      const evidence = edges.map((row) => row[j])
+      const predecessorIndex = edges.findIndex((row) => row[j].accepted)
+      const conflict = duplicateIds || inDegree[j] > 1
+        || (predecessorIndex >= 0 && outDegree[predecessorIndex] > 1)
+      const seedValid = Number.isFinite(aspect) && aspect > 0
+        && Number.isFinite(candidate.features.area) && candidate.features.area > 0
+        && Number.isFinite(candidate.features.center.x) && Number.isFinite(candidate.features.center.y)
+        && matchPhaseTarget(candidate.features, [candidate]).reliable
+      // Seed validation establishes no cross-frame identity.
+      if (conflict || !seedValid) {
+        observations.push({ reference, segmentId: null, association: 'unresolved',
+          reason: duplicateIds ? 'DUPLICATE_CANDIDATE_PROVENANCE' : conflict ? 'COMPETING_ASSIGNMENTS' : 'INSUFFICIENT_SEED_GEOMETRY',
+          predecessor: null, evidence })
+        return
+      }
+      if (predecessorIndex >= 0) {
+        const track = active[predecessorIndex], predecessor = track.segment.observations[track.segment.observations.length - 1]
+        track.segment.observations.push(reference.candidateId)
+        next.push({ segment: track.segment, history: [...track.history.slice(-1), { timestamp: frame.timestamp, features: candidate.features }] })
+        continued.add(track.segment.id)
+        observations.push({ reference, segmentId: track.segment.id, association: 'locally-associated',
+          reason: 'UNIQUE_MUTUAL_CONTINUITY', predecessor, evidence })
+      } else {
+        const segment: CompetitorSegment = { id: 'local-' + segments.length, observations: [reference.candidateId],
+          termination: { frameId: null, reason: 'END_OF_OBSERVED_STREAM' } }
+        segments.push(segment)
+        next.push({ segment, history: [{ timestamp: frame.timestamp, features: candidate.features }] })
+        observations.push({ reference, segmentId: segment.id, association: 'new-local-segment',
+          reason: active.length ? 'NO_SUPPORTED_PREDECESSOR' : 'NEW_LOCAL_OBSERVATION', predecessor: null, evidence })
+      }
+    })
+    active.forEach((t, i) => {
+      if (!continued.has(t.segment.id)) t.segment.termination = { frameId: frame.frameId,
+        reason: !candidates.length ? 'MISSED_DETECTION' : outDegree[i] > 1 || edges[i].some((e, j) => e.accepted && inDegree[j] > 1)
+          ? 'COMPETING_ASSIGNMENTS' : 'NO_SUPPORTED_CONTINUATION' }
+    })
+    active = next; previous = frame
+  }
+  const coverage = observations.filter((o) => o.reference.qualification === 'unusable').map((o) => {
+    const r = o.reference, direction = r.direction === 'backward' ? -1 : 1
+    // Decision bound is explicit and causal in the corresponding tracking direction.
+    const decisions = frames.filter((f) => f.origin !== 'dense' && f.diagnosticCode.startsWith('REACQUISITION_')
+      && (f.direction === 'backward' ? -1 : 1) === direction && (f.timestamp - r.timestamp) * direction > 0)
+      .sort((a, b) => direction * (a.timestamp - b.timestamp))
+    const decision = decisions[0]
+    const segment = segments.find((s) => s.id === o.segmentId)
+    const position = segment?.observations.indexOf(r.candidateId) ?? -1
+    const later = segment?.observations.slice(position + 1).map((id) => observations.find((v) => v.reference.candidateId === id)!) ?? []
+    const covering = decision && later.find((v) => v.reference.qualification === 'qualified'
+      && (decision.timestamp - v.reference.timestamp) * direction > 0)
+    return { observation: r.candidateId, segmentId: o.segmentId, decisionFrame: decision?.frameId ?? null,
+      decisionTimestamp: decision?.timestamp ?? null, coveringObservation: covering?.reference.candidateId ?? null,
+      path: covering ? segment!.observations.slice(position, segment!.observations.indexOf(covering.reference.candidateId) + 1) : [],
+      status: covering ? 'potential-shadow-coverage' : 'unresolved',
+      reason: !o.segmentId ? 'UNRESOLVED_COMPETITOR_IDENTITY' : !decision ? 'NO_CAUSAL_DECISION_BOUND'
+        : covering ? 'QUALIFIED_LATER_OBSERVATION_ON_CONTINUOUS_LOCAL_PATH' : 'NO_QUALIFIED_CONTINUOUS_REFERENCE_BEFORE_DECISION' }
+  })
+  return { observations, segments, exclusions, coverage,
+    unresolvedObligations: observations.filter((o) => o.association === 'unresolved').map((o) => o.reference.candidateId) }
+}
