@@ -553,3 +553,117 @@ export function buildReferenceLedger(videoId: string | null, runId: string | nul
   }
   return { records, qualifiedTargets: records.filter((r) => r.shadowReferenceEligible) }
 }
+
+// Dense acquisition is shadow-only. Never feed its output into trackIdentity,
+// evaluateReacquisition, phase selection, or the support input of another pass.
+export type AcquisitionSupport = {
+  frameId: string; timestamp: number; evidence: IdentityEvidence; diagnosticCode: string
+  origin: 'coarse' | 'manual-anchor' | 'dense'
+  direction: 'anchor' | 'forward' | 'backward'
+}
+export type AcquisitionBracket = {
+  id: string; left: AcquisitionSupport; right: AcquisitionSupport
+  direction: 'forward' | 'backward'; segment: number; timestamps: number[]
+  requested: number; incomplete: boolean
+}
+export function planTargetAcquisition(input: AcquisitionSupport[]) {
+  const cadence = 0.1, perBracketCap = 10, perRunCap = 60
+  // Clone and recursively freeze: caller mutations and harvested results cannot
+  // change the pre-existing evidence supporting this pass.
+  const freeze = <T,>(value: T): T => {
+    if (value && typeof value === 'object') {
+      Object.values(value).forEach(freeze)
+      Object.freeze(value)
+    }
+    return value
+  }
+  const supports = freeze(structuredClone(input).sort((a, b) => a.timestamp - b.timestamp || a.frameId.localeCompare(b.frameId)))
+  const brackets: AcquisitionBracket[] = []
+  const skipped: Array<{ left: string; right: string; reason: string }> = []
+  const timeCounts = new Map<number, number>(), idCounts = new Map<string, number>()
+  supports.forEach((s) => {
+    timeCounts.set(s.timestamp, (timeCounts.get(s.timestamp) ?? 0) + 1)
+    idCounts.set(s.frameId, (idCounts.get(s.frameId) ?? 0) + 1)
+  })
+  let used = 0
+  for (let i = 1; i < supports.length; i++) {
+    const left = supports[i - 1], right = supports[i], dt = right.timestamp - left.timestamp
+    const valid = (s: AcquisitionSupport) => s.origin !== 'dense' && s.evidence.accepted
+      && s.evidence.poseIndex !== null && !!s.evidence.observation
+      && s.evidence.observation.timestamp === s.timestamp
+      && ((s.origin === 'coarse' && s.diagnosticCode === 'ACCEPTED_TARGET')
+        || (s.origin === 'manual-anchor' && s.diagnosticCode === 'USER_SELECTED_ANCHOR'))
+    let reason = ''
+    if (!valid(left) || !valid(right)) reason = 'UNTRUSTED_OR_BOUNDARY_SUPPORT'
+    else if (!Number.isFinite(dt) || dt <= 0 || dt > 1.2) reason = 'UNSUPPORTED_IDENTITY_GAP'
+    else if ([left, right].some((s) => timeCounts.get(s.timestamp)! > 1 || idCounts.get(s.frameId)! > 1)) reason = 'DUPLICATE_SUPPORT'
+    else if ((left.evidence.observation!.segment ?? 0) !== (right.evidence.observation!.segment ?? 0)) reason = 'SEGMENT_BOUNDARY'
+    else if ((left.direction !== right.direction && left.direction !== 'anchor' && right.direction !== 'anchor')
+      || (left.direction === 'anchor' && right.direction !== 'forward')
+      || (right.direction === 'anchor' && left.direction !== 'backward')) reason = 'DIRECTION_BOUNDARY'
+    // A manual anchor is only compatible with the original segment.
+    else if ([left, right].some((s) => s.origin === 'manual-anchor')
+      && [left, right].some((s) => (s.evidence.observation!.segment ?? 0) !== 0)) reason = 'MANUAL_ANCHOR_BOUNDARY'
+    if (reason) { skipped.push({ left: left.frameId, right: right.frameId, reason }); continue }
+    const requested = Math.max(0, Math.ceil(dt / cadence) - 1)
+    const count = Math.min(requested, perBracketCap, perRunCap - used)
+    const timestamps = Array.from({ length: count }, (_, j) => left.timestamp + dt * (j + 1) / (count + 1))
+    brackets.push({ id: JSON.stringify([left.frameId, right.frameId]), left, right,
+      direction: left.direction === 'anchor' ? 'forward' : left.direction, segment: left.evidence.observation!.segment ?? 0,
+      timestamps, requested, incomplete: count < requested })
+    used += count
+  }
+  return freeze({ brackets, skipped, cadence, perBracketCap, perRunCap, planned: used,
+    incomplete: brackets.some((b) => b.incomplete) })
+}
+
+export type AcquiredTarget = {
+  videoId: string | null; runId: string; passId: string; frameId: string; timestamp: number
+  acquisitionOrigin: 'dense-trusted-bracket'; bracketId: string
+  supportingEndpoints: { left: { frameId: string; timestamp: number }; right: { frameId: string; timestamp: number } }
+  direction: 'forward' | 'backward'; segment: number; aspect: number
+  status: 'qualified' | 'unusable' | 'unassociated' | 'extraction-failure' | 'detection-failure'
+  reasons: string[]; reference: ReferenceObservation | null
+  // Full qualified geometry for related-evidence diagnostics only.
+  geometry: number[] | null
+}
+export function assessAcquiredTarget(bracket: AcquisitionBracket, timestamp: number,
+  candidates: ReferenceLedgerFrame['candidates'], aspect: number,
+  context: { videoId: string | null; runId: string; passId: string },
+  failure?: 'extraction-failure' | 'detection-failure'): AcquiredTarget {
+  const frameId = context.passId + ':' + bracket.id + ':' + String(timestamp)
+  const result: AcquiredTarget = { ...context, frameId, timestamp, acquisitionOrigin: 'dense-trusted-bracket',
+    bracketId: bracket.id, supportingEndpoints: {
+      left: { frameId: bracket.left.frameId, timestamp: bracket.left.timestamp },
+      right: { frameId: bracket.right.frameId, timestamp: bracket.right.timestamp } },
+    direction: bracket.direction, segment: bracket.segment, aspect,
+    status: failure ?? 'unassociated', reasons: failure ? [failure] : [], reference: null, geometry: null }
+  if (failure) return result
+  if (!bracket.timestamps.includes(timestamp) || timestamp <= bracket.left.timestamp || timestamp >= bracket.right.timestamp) {
+    result.reasons = ['OUTSIDE_FROZEN_SAMPLE_PLAN']; return result
+  }
+  // Only the two frozen endpoints support association; no harvested history.
+  const identity = refineIdentity([bracket.left.evidence.observation!, bracket.right.evidence.observation!], timestamp, candidates, aspect)
+  if (!identity.accepted) { result.reasons = [identity.reason]; return result }
+  const target = candidates.find((c) => c.poseIndex === identity.poseIndex)!
+  const reference = buildReferenceLedger(context.videoId, context.runId, bracket.direction === 'forward' ? bracket.left.timestamp : bracket.right.timestamp,
+    aspect, [{ frameId, timestamp, evidence: identity, candidates: [target] }]).records[0]
+  result.reference = reference
+  result.geometry = reacquisitionGeometry(target.features, aspect)
+  result.status = reference.qualification
+  result.reasons = [...reference.qualityFailures]
+  return result
+}
+
+export function relatedAcquiredTargets(observations: AcquiredTarget[]) {
+  const qualified = observations.filter((r) => r.status === 'qualified' && r.geometry)
+  return qualified.flatMap((a, i) => qualified.slice(i + 1).map((b) => ({
+    left: a.frameId, right: b.frameId, temporalDistance: Math.abs(a.timestamp - b.timestamp),
+    sharedBracket: a.bracketId === b.bracketId,
+    sharedEndpoints: [a.supportingEndpoints.left.frameId, a.supportingEndpoints.right.frameId]
+      .filter((id) => id === b.supportingEndpoints.left.frameId || id === b.supportingEndpoints.right.frameId),
+    duplicateTimestamp: a.timestamp === b.timestamp,
+    sameDetectionSource: a.reference?.detectionSource === b.reference?.detectionSource,
+    geometryDistance: Math.sqrt(a.geometry!.reduce((sum, v, j) => sum + (v - b.geometry![j]) ** 2, 0) / a.geometry!.length),
+  })))
+}

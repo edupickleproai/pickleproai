@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, type ChangeEvent } from 'react'
 import BiomechanicsPanel from './BiomechanicsPanel'
-import { buildReferenceLedger, type ReferenceObservation, trackIdentity, refineIdentity, identitySequenceAllowed, type IdentityEvidence, type IdentityObservation, type IdentityDiagnostic } from '@/lib/phase-detection'
+import { planTargetAcquisition, assessAcquiredTarget, relatedAcquiredTargets, type AcquiredTarget, buildReferenceLedger, type ReferenceObservation, trackIdentity, refineIdentity, identitySequenceAllowed, type IdentityEvidence, type IdentityObservation, type IdentityDiagnostic } from '@/lib/phase-detection'
 import type { NormalizedLandmark } from '@mediapipe/tasks-vision'
 import { planCoarseSampling, detectPhases, overridePhase, phaseGeometry, planPhaseRefinement, refinePhases, type RefinementResult, type PhaseResult, type PhaseCandidate } from '@/lib/phase-detection'
 import { buildCoachingBiomechanicsPayload, clearStoredVideoBiomechanics, COACHING_BIOMECHANICS_STORAGE_KEY, videoFingerprint } from '@/lib/coaching-biomechanics'
@@ -380,6 +380,8 @@ export default function PoseTestPage() {
   const [persistentAnchor, setPersistentAnchor] = useState<null | { id: string; features: any; timestamp?: number; poseIndex: number; pose: PoseResult }>(null)
   const [persistentAssignment, setPersistentAssignment] = useState<Record<Phase, { persistentPlayerId?: string; poseIndex?: number; score?: number; manual?: boolean }>>({ ready: {}, contact: {}, recovery: {} } as any)
   const [matchCandidates, setMatchCandidates] = useState<Record<Phase, Array<any>>>({ ready: [], contact: [], recovery: [] } as any)
+  const [acquisition, setAcquisition] = useState<{ plan: ReturnType<typeof planTargetAcquisition>; observations: AcquiredTarget[]; error?: string } | null>(null)
+  const acquisitionPass = useRef(0)
   const [referenceLedger, setReferenceLedger] = useState<ReferenceObservation[]>([])
   const [autoResult, setAutoResult] = useState<PhaseResult | null>(null)
   const [refinement, setRefinement] = useState<RefinementResult | null>(null)
@@ -403,7 +405,7 @@ export default function PoseTestPage() {
 
   const resetVideoAnalysis = () => {
     setRefinedFrames([])
-    setReferenceLedger([]); setAutoResult(null); setRefinement(null); setLocalEvidence([])
+    setAcquisition(null); setReferenceLedger([]); setAutoResult(null); setRefinement(null); setLocalEvidence([])
     setAutoBusy(false)
     autoCache.current.clear()
     setSelectionOrigin({ ready: 'MANUAL', contact: 'MANUAL', recovery: 'MANUAL' })
@@ -445,7 +447,7 @@ export default function PoseTestPage() {
   }, [])
 
   const handleFileChange = (phase: Phase) => (event: ChangeEvent<HTMLInputElement>) => {
-    setReferenceLedger([]); setAutoResult(null); setRefinement(null); setLocalEvidence([])
+    setAcquisition(null); setReferenceLedger([]); setAutoResult(null); setRefinement(null); setLocalEvidence([])
     autoCache.current.clear()
     sourceGeneration.current += 1
     setPhaseVideoFingerprint((s) => ({ ...s, [phase]: null }))
@@ -865,7 +867,7 @@ export default function PoseTestPage() {
     if (!persistentAnchor || autoBusy) return
     const generation = ++sourceGeneration.current
     setAutoBusy(true)
-    setReferenceLedger([]); setAutoResult(null); setRefinement(null); setLocalEvidence([])
+    setAcquisition(null); setReferenceLedger([]); setAutoResult(null); setRefinement(null); setLocalEvidence([])
     autoCache.current.clear()
     setAnalyses({ ready: null, contact: null, recovery: null })
     setSelectedPoseIndex({ ready: null, contact: null, recovery: null })
@@ -1022,6 +1024,74 @@ export default function PoseTestPage() {
     } finally {
       video.removeAttribute('src')
       video.load()
+      if (generation === sourceGeneration.current) setAutoBusy(false)
+    }
+  }
+
+  const runTargetAcquisition = async () => {
+    if (!autoResult || !persistentAnchor || persistentAnchor.timestamp == null || !videoUrl || !videoMeta || autoBusy) return
+    const generation = sourceGeneration.current
+    const anchorTime = persistentAnchor.timestamp
+    const plan = planTargetAcquisition(frames.map((frame) => {
+      const entry = autoCache.current.get(frame.frameId)
+      return { frameId: frame.frameId, timestamp: frame.timestampSeconds,
+        evidence: entry?.identity ?? { accepted: false, poseIndex: null, score: 0, reason: 'Missing coarse evidence' },
+        diagnosticCode: entry?.diagnostic?.code ?? 'MISSING_DIAGNOSTIC',
+        origin: frame.timestampSeconds === anchorTime ? 'manual-anchor' : 'coarse',
+        direction: frame.timestampSeconds === anchorTime ? 'anchor' : frame.timestampSeconds > anchorTime ? 'forward' : 'backward' }
+    }))
+    const context = { videoId: videoFile ? videoFingerprint(videoFile) : null, runId: String(generation),
+      passId: String(generation) + '-acquisition-' + (++acquisitionPass.current) }
+    const observations: AcquiredTarget[] = []
+    setAcquisition({ plan, observations: [] })
+    if (!plan.planned) return
+    setAutoBusy(true)
+    const video = document.createElement('video')
+    const waitVideo = (event: 'loadeddata' | 'seeked', action: () => void) => new Promise<void>((resolve, reject) => {
+      const cleanup = () => { clearTimeout(timer); video.removeEventListener(event, done); video.removeEventListener('error', failed) }
+      const done = () => { cleanup(); resolve() }
+      const failed = () => { cleanup(); reject(new Error('Acquisition video extraction failed')) }
+      const timer = setTimeout(failed, 8000)
+      video.addEventListener(event, done, { once: true }); video.addEventListener('error', failed, { once: true })
+      action()
+    })
+    try {
+      await waitVideo('loadeddata', () => { video.preload = 'auto'; video.src = videoUrl; video.load() })
+      const canvas = document.createElement('canvas')
+      const scale = Math.min(1, 1280 / video.videoWidth)
+      canvas.width = Math.round(video.videoWidth * scale); canvas.height = Math.round(video.videoHeight * scale)
+      const ctx = canvas.getContext('2d')
+      if (!ctx) throw new Error('Acquisition canvas unavailable')
+      for (const bracket of plan.brackets) for (const timestamp of bracket.timestamps) {
+        if (generation !== sourceGeneration.current) return
+        setProcessingStatus(`Shadow target acquisition: ${observations.length + 1}/${plan.planned}`)
+        let stage: 'extraction-failure' | 'detection-failure' = 'extraction-failure'
+        try {
+          if (Math.abs(video.currentTime - timestamp) > 0.000001) await waitVideo('seeked', () => { video.currentTime = timestamp })
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+          const image = new Image()
+          image.src = canvas.toDataURL('image/jpeg', 0.92)
+          await image.decode()
+          if (generation !== sourceGeneration.current) return
+          stage = 'detection-failure'
+          const size = { width: image.naturalWidth, height: image.naturalHeight }
+          const poses = await detectMultiPass(image, size)
+          if (generation !== sourceGeneration.current) return
+          observations.push(assessAcquiredTarget(bracket, timestamp, poses.map((pose) => ({
+            poseIndex: pose.poseIndex, detectionSource: pose.detectionSource, features: extractFeatures(pose, size),
+          })), videoMeta.width / videoMeta.height, context))
+        } catch {
+          if (generation !== sourceGeneration.current) return
+          observations.push(assessAcquiredTarget(bracket, timestamp, [], videoMeta.width / videoMeta.height, context, stage))
+        }
+        setAcquisition({ plan, observations: [...observations] })
+        await new Promise((resolve) => setTimeout(resolve, 0))
+      }
+      if (generation === sourceGeneration.current) setProcessingStatus('Shadow acquisition complete. Tracking, phase selection and reacquisition inputs are unchanged.')
+    } catch {
+      if (generation === sourceGeneration.current) setAcquisition({ plan, observations: [...observations], error: 'Acquisition setup failed; sampling incomplete.' })
+    } finally {
+      video.removeAttribute('src'); video.load()
       if (generation === sourceGeneration.current) setAutoBusy(false)
     }
   }
@@ -1290,7 +1360,7 @@ export default function PoseTestPage() {
         if (phase === 'ready') {
           const features = extractFeatures(pose, canvasSizes[phase])
           sourceGeneration.current += 1
-          setReferenceLedger([]); setAutoResult(null); setRefinement(null); setLocalEvidence([])
+          setAcquisition(null); setReferenceLedger([]); setAutoResult(null); setRefinement(null); setLocalEvidence([])
           setAutoBusy(false)
           autoCache.current.clear()
           setPersistentAnchor({ id: 'TARGET_A', features, timestamp: lastFrameMeta.ready?.timestampSeconds, poseIndex: pose.poseIndex, pose })
@@ -1540,7 +1610,7 @@ export default function PoseTestPage() {
               {frames.length > 0 && <section className="rounded-3xl border border-slate-700 bg-slate-950 p-6 space-y-3">
                 <h2 className="text-xl font-semibold">Automatic Phase Detection</h2>
                 <p className="text-sm text-slate-300">Assign one clear frame to Ready, analyze it, and click the physical player once to identify TARGET_A. Then scan the video. Manual assignment remains available.</p>
-                <label className="block">Paddle hand <select aria-label="Paddle hand" value={paddleHand} disabled={autoBusy} onChange={(e) => { setPaddleHand(e.target.value as 'left' | 'right'); setReferenceLedger([]); setAutoResult(null); setRefinement(null); setLocalEvidence([]); autoCache.current.clear() }} className="bg-slate-800 p-2"><option value="right">Right</option><option value="left">Left</option></select></label>
+                <label className="block">Paddle hand <select aria-label="Paddle hand" value={paddleHand} disabled={autoBusy} onChange={(e) => { setPaddleHand(e.target.value as 'left' | 'right'); setAcquisition(null); setReferenceLedger([]); setAutoResult(null); setRefinement(null); setLocalEvidence([]); autoCache.current.clear() }} className="bg-slate-800 p-2"><option value="right">Right</option><option value="left">Left</option></select></label>
                 <button type="button" disabled={!persistentAnchor || autoBusy || extracting || phases.some((p) => loading[p])} onClick={runAutomaticPhases} className="rounded bg-emerald-600 p-3 disabled:opacity-40">{autoBusy ? 'Scanning / analyzing…' : 'Propose automatic phases'}</button>
                 {autoResult && <>
                   <button type="button" disabled={autoBusy || autoResult.proposals.length !== 3} onClick={runLocalRefinement} className="rounded border border-emerald-500 p-3 disabled:opacity-40">Refine local phase timing</button>
@@ -1560,6 +1630,17 @@ export default function PoseTestPage() {
                   {!autoResult.proposals.length && <p>Unresolved — keep manual selection.</p>}
                   <details className="text-xs border border-slate-600 p-2">
                     <summary>Reference provenance — shadow diagnostics only ({referenceLedger.length} observations)</summary>
+                    <button type="button" disabled={autoBusy} onClick={runTargetAcquisition} className="border p-2 disabled:opacity-40">Acquire shadow TARGET_A observations</button>
+                    {acquisition && <details open><summary>Dense target acquisition — shadow only</summary>
+                      <p>Eligible brackets: {acquisition.plan.brackets.length} · skipped: {acquisition.plan.skipped.length} · attempted: {acquisition.observations.length}/{acquisition.plan.planned} planned · run cap: {acquisition.plan.perRunCap} · bracket cap: {acquisition.plan.perBracketCap}</p>
+                      <p>Safely associated: {acquisition.observations.filter((r) => r.reference !== null).length} · qualified: {acquisition.observations.filter((r) => r.status === 'qualified').length} · unusable: {acquisition.observations.filter((r) => r.status === 'unusable').length} · unassociated: {acquisition.observations.filter((r) => r.status === 'unassociated').length} · extraction/detection failures: {acquisition.observations.filter((r) => r.status.endsWith('failure')).length}</p>
+                      <p>{acquisition.error ?? (acquisition.plan.incomplete ? 'Budget-limited: acquisition coverage incomplete.' : 'Planned sampling fits the budgets. This does not establish sufficient identity evidence.')}</p>
+                      <p>Qualified timestamps: {acquisition.observations.filter((r) => r.status === 'qualified').map((r) => r.timestamp.toFixed(3)).join(', ') || 'none'}. Shared support does not imply independent evidence.</p>
+                      {acquisition.plan.brackets.map((b) => <p key={b.id}>{b.left.timestamp.toFixed(3)}–{b.right.timestamp.toFixed(3)}s · attempted {acquisition.observations.filter((r) => r.bracketId === b.id).length}/{b.timestamps.length} planned · requested {b.requested} · {b.incomplete ? 'budget limited' : 'within budget'}</p>)}
+                      <details><summary>Skipped brackets</summary><pre className="whitespace-pre-wrap">{JSON.stringify(acquisition.plan.skipped, null, 2)}</pre></details>
+                      <details><summary>Observation provenance and failures</summary><pre className="whitespace-pre-wrap">{JSON.stringify(acquisition.observations, null, 2)}</pre></details>
+                      <details><summary>Related/shared-support observations</summary><pre className="whitespace-pre-wrap">{JSON.stringify(relatedAcquiredTargets(acquisition.observations), null, 2)}</pre></details>
+                    </details>}
                     <p>Qualification does not change authorization. Competitors have no persistent identity; qualified observations are not independent identity evidence.</p>
                     {(['target', 'competitor'] as const).map((role) => {
                       const rows = referenceLedger.filter((r) => r.role === role)
@@ -1681,7 +1762,7 @@ export default function PoseTestPage() {
                             if (phase === 'ready') {
                               sourceGeneration.current += 1
                               setPersistentAnchor(null)
-                              setReferenceLedger([]); setAutoResult(null); setRefinement(null); setLocalEvidence([])
+                              setAcquisition(null); setReferenceLedger([]); setAutoResult(null); setRefinement(null); setLocalEvidence([])
                               autoCache.current.clear()
                             }
                             setSelectionOrigin((s) => overridePhase(s, phase, 'MANUAL OVERRIDE'))

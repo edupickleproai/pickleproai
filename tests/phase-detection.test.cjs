@@ -706,7 +706,7 @@ test('ledger: confirmed target retained but pending history and confirmation neg
 })
 test('checkpoint equivalence: tracking lock reacquisition and phases unchanged',()=>{
   const {execFileSync}=require('node:child_process')
-  const source=execFileSync('git',['show','ac157033e80bf1fee3008a07c88b8dac3d452a70:src/lib/phase-detection.ts'],{encoding:'utf8'})
+  const source=execFileSync('git',['show','6ca012b3fa30f908662a3be6a1694061c003bb96:src/lib/phase-detection.ts'],{encoding:'utf8'})
   const baseline=new Module(filename,module)
   baseline._compile(ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText,filename)
   const frames=[{frameId:'trusted',timestamp:.55,candidates:[rqCandidate(1,.31)]},{frameId:'gap',timestamp:2,candidates:[]},
@@ -717,4 +717,130 @@ test('checkpoint equivalence: tracking lock reacquisition and phases unchanged',
     assert.deepEqual(rqStep(3,candidates),baseline.exports.evaluateReacquisition(rqTrusted(),rqNegatives(),3,candidates,1))
   const phases=Array.from({length:12},(_,i)=>({frameId:'p'+i,timestamp:i*.55,targetScore:1,matched:true,reach:Math.sin(i)+2,wrist:{x:i*.1,y:Math.sin(i)}}))
   assert.deepEqual(detectPhases(phases),baseline.exports.detectPhases(phases))
+})
+
+const { planTargetAcquisition, assessAcquiredTarget, relatedAcquiredTargets } = mod.exports
+function aqSupport(timestamp, x=.3, overrides={}) {
+  return {frameId:'support-'+timestamp,timestamp,origin:'coarse',direction:'forward',diagnosticCode:'ACCEPTED_TARGET',
+    evidence:{accepted:true,poseIndex:1,score:1,reason:'ACCEPTED_TARGET',observation:{timestamp,features:rqPlayer(x),segment:0}},...overrides}
+}
+const aqContext={videoId:'video',runId:'run',passId:'pass'}
+const aqPlan=()=>planTargetAcquisition([aqSupport(0),aqSupport(.55,.31)])
+const aqObserve=(plan=aqPlan(),candidates=[rqCandidate(7,.305)])=>assessAcquiredTarget(plan.brackets[0],plan.brackets[0].timestamps[0],candidates,1,aqContext)
+test('acquisition: supported same-segment endpoints create bracket',()=>{
+  assert.equal(aqPlan().brackets.length,1); assert.equal(aqPlan().planned,5)
+})
+test('acquisition: unsupported gap blocks sampling',()=>{
+  const p=planTargetAcquisition([aqSupport(0),aqSupport(1.21)])
+  assert.equal(p.planned,0); assert.equal(p.skipped[0].reason,'UNSUPPORTED_IDENTITY_GAP')
+})
+for (const code of ['CONTINUITY_LOCKED','REACQUISITION_PENDING_CONFIRMATION','REACQUISITION_CONFIRMED','MANUAL_REANCHOR','UNSUPPORTED_IDENTITY_GAP']) {
+  test('acquisition: explicit boundary blocks even with matching segment: '+code,()=>{
+    const p=planTargetAcquisition([aqSupport(0),aqSupport(.25,.305,{diagnosticCode:code}),aqSupport(.55,.31)])
+    assert.equal(p.planned,0); assert.equal(p.skipped.length,2)
+  })
+}
+test('acquisition: segment mismatch and direction mismatch block',()=>{
+  const right=aqSupport(.55); right.evidence.observation.segment=1
+  assert.equal(planTargetAcquisition([aqSupport(0),right]).planned,0)
+  assert.equal(planTargetAcquisition([aqSupport(0,.3,{direction:'backward'}),aqSupport(.55)]).planned,0)
+})
+test('acquisition: anchor joins only its correct directional side',()=>{
+  const anchor=aqSupport(0,.3,{direction:'anchor',origin:'manual-anchor',diagnosticCode:'USER_SELECTED_ANCHOR'})
+  assert.equal(planTargetAcquisition([anchor,aqSupport(.55)]).brackets.length,1)
+  assert.equal(planTargetAcquisition([aqSupport(-.55,.3,{direction:'backward'}),anchor]).brackets.length,1)
+  assert.equal(planTargetAcquisition([anchor,aqSupport(.55,.3,{direction:'backward'})]).planned,0)
+})
+test('acquisition: interior timestamps exclude endpoints and are ordered',()=>{
+  const b=aqPlan().brackets[0]
+  assert.ok(b.timestamps.every(t=>t>0&&t<.55))
+  assert.deepEqual(b.timestamps,[...b.timestamps].sort((a,b)=>a-b))
+})
+test('acquisition: deterministic even when support input is reordered',()=>{
+  const a=[aqSupport(0),aqSupport(.55)]
+  assert.deepEqual(planTargetAcquisition(a),planTargetAcquisition([...a].reverse()))
+})
+test('acquisition: per bracket budget reports incomplete coverage',()=>{
+  const p=planTargetAcquisition([aqSupport(0),aqSupport(1.19)])
+  assert.equal(p.planned,10); assert.equal(p.incomplete,true)
+})
+test('acquisition: per-run budget reports later unprocessed brackets',()=>{
+  const p=planTargetAcquisition(Array.from({length:30},(_,i)=>aqSupport(i*.55)))
+  assert.equal(p.planned,60); assert.equal(p.incomplete,true)
+  assert.ok(p.brackets.some(b=>b.timestamps.length===0))
+})
+test('acquisition: endpoint snapshot is deep frozen and caller-independent',()=>{
+  const inputs=[aqSupport(0),aqSupport(.55)]
+  const p=planTargetAcquisition(inputs)
+  inputs[0].evidence.observation.features.landmarks[11].x=999
+  assert.notEqual(p.brackets[0].left.evidence.observation.features.landmarks[11].x,999)
+  assert.ok(Object.isFrozen(p.brackets[0].left.evidence.observation.features.landmarks[11]))
+})
+test('acquisition: dense support cannot recursively authorize a bracket',()=>{
+  assert.equal(planTargetAcquisition([aqSupport(0),aqSupport(.55,.31,{origin:'dense'})]).planned,0)
+})
+test('acquisition: agreement from both original endpoints required',()=>{
+  const p=planTargetAcquisition([aqSupport(0),aqSupport(.55,.8)])
+  assert.equal(aqObserve(p).status,'unassociated')
+})
+test('acquisition: ambiguous detections stay unassociated',()=>{
+  assert.equal(aqObserve(aqPlan(),[rqCandidate(3,.305),rqCandidate(4,.306)]).status,'unassociated')
+})
+test('acquisition: pose index neither establishes nor prevents association',()=>{
+  assert.equal(aqObserve(aqPlan(),[rqCandidate(1,.8)]).status,'unassociated')
+  assert.equal(aqObserve(aqPlan(),[rqCandidate(12,.305)]).status,'qualified')
+})
+test('acquisition: associated poor limb visibility remains unusable',()=>{
+  const c=rqCandidate(5,.305); c.features.landmarks[15].visibility=.2
+  const r=aqObserve(aqPlan(),[c])
+  assert.equal(r.status,'unusable'); assert.ok(r.reference)
+  assert.deepEqual(r.reasons,['LANDMARK_15_INSUFFICIENT_VISIBILITY'])
+})
+test('acquisition: qualified observations have ledger record and supporting provenance',()=>{
+  const r=aqObserve()
+  assert.equal(r.status,'qualified'); assert.equal(r.reference.shadowReferenceEligible,true)
+  assert.equal(r.acquisitionOrigin,'dense-trusted-bracket')
+  assert.deepEqual(r.supportingEndpoints,{left:{frameId:'support-0',timestamp:0},right:{frameId:'support-0.55',timestamp:.55}})
+  assert.equal(r.passId,'pass'); assert.equal(r.reference.physicalIdentity,'TARGET_A')
+})
+test('acquisition: anchor-only history yields no brackets',()=>{
+  assert.equal(planTargetAcquisition([aqSupport(0)]).planned,0)
+})
+test('acquisition: duplicates and adjacent samples report relatedness, not independence',()=>{
+  const p=aqPlan(), a=aqObserve(p)
+  const b=assessAcquiredTarget(p.brackets[0],p.brackets[0].timestamps[1],[rqCandidate(8,.305)],1,aqContext)
+  const pairs=relatedAcquiredTargets([a,b,a])
+  assert.equal(pairs[0].sharedBracket,true); assert.equal(pairs[0].sharedEndpoints.length,2)
+  assert.equal(pairs[0].geometryDistance,0)
+  assert.ok(pairs.some(p=>p.duplicateTimestamp))
+  assert.equal(pairs[0].independent,undefined)
+  assert.equal(planTargetAcquisition([aqSupport(0),aqSupport(0),aqSupport(.55)]).planned,0)
+})
+test('acquisition: failures and unplanned samples cannot enroll',()=>{
+  const p=aqPlan(), b=p.brackets[0]
+  for(const failure of ['extraction-failure','detection-failure']) {
+    const r=assessAcquiredTarget(b,b.timestamps[0],[],1,aqContext,failure)
+    assert.equal(r.status,failure); assert.equal(r.reference,null)
+  }
+  assert.equal(assessAcquiredTarget(b,b.left.timestamp,[rqCandidate()],1,aqContext).status,'unassociated')
+})
+test('acquisition: shadow harvest leaves authoritative eligibility blocked',()=>{
+  const trusted=rqTrusted().slice(0,1), negatives=rqNegatives()
+  const before=evaluateReacquisition(trusted,negatives,3,[rqCandidate()],1)
+  aqObserve()
+  assert.deepEqual(evaluateReacquisition(trusted,negatives,3,[rqCandidate()],1),before)
+  assert.equal(before.diagnostic.code,'REACQUISITION_NOT_ATTEMPTED_INSUFFICIENT_REFERENCE')
+})
+test('acquisition: base checkpoint decisions and downstream code remain unchanged',()=>{
+  const {execFileSync}=require('node:child_process')
+  const base='6ca012b3fa30f908662a3be6a1694061c003bb96'
+  const read=(file)=>execFileSync('git',['show',base+':'+file],{encoding:'utf8'}).replace(/\r\n/g,'\n')
+  const source=read('src/lib/phase-detection.ts')
+  assert.ok(fs.readFileSync(filename,'utf8').replace(/\r\n/g,'\n').startsWith(source.trimEnd()))
+  for(const file of ['src/lib/coaching-biomechanics.ts','src/app/pose-test/BiomechanicsPanel.tsx','src/app/api/coach/route.ts','src/app/api/video-analysis/route.ts']) {
+    assert.equal(fs.readFileSync(path.resolve(__dirname,'..',file),'utf8').replace(/\r\n/g,'\n'),read(file))
+  }
+  const page=fs.readFileSync(path.resolve(__dirname,'../src/app/pose-test/page.tsx'),'utf8')
+  const handler=page.slice(page.indexOf('  const runTargetAcquisition'),page.indexOf('  const acceptAutomaticPhases'))
+  for(const forbidden of ['autoCache.current.set','trackIdentity(','evaluateReacquisition(','setReferenceLedger(','setRefinedFrames(','setAnalyses(','localStorage']) assert.equal(handler.includes(forbidden),false)
 })
