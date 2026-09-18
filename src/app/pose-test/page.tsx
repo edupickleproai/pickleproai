@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, type ChangeEvent } from 'react'
 import BiomechanicsPanel from './BiomechanicsPanel'
-import { trackIdentity, refineIdentity, identitySequenceAllowed, type IdentityEvidence, type IdentityObservation, type IdentityDiagnostic } from '@/lib/phase-detection'
+import { buildReferenceLedger, type ReferenceObservation, trackIdentity, refineIdentity, identitySequenceAllowed, type IdentityEvidence, type IdentityObservation, type IdentityDiagnostic } from '@/lib/phase-detection'
 import type { NormalizedLandmark } from '@mediapipe/tasks-vision'
 import { planCoarseSampling, detectPhases, overridePhase, phaseGeometry, planPhaseRefinement, refinePhases, type RefinementResult, type PhaseResult, type PhaseCandidate } from '@/lib/phase-detection'
 import { buildCoachingBiomechanicsPayload, clearStoredVideoBiomechanics, COACHING_BIOMECHANICS_STORAGE_KEY, videoFingerprint } from '@/lib/coaching-biomechanics'
@@ -380,6 +380,7 @@ export default function PoseTestPage() {
   const [persistentAnchor, setPersistentAnchor] = useState<null | { id: string; features: any; timestamp?: number; poseIndex: number; pose: PoseResult }>(null)
   const [persistentAssignment, setPersistentAssignment] = useState<Record<Phase, { persistentPlayerId?: string; poseIndex?: number; score?: number; manual?: boolean }>>({ ready: {}, contact: {}, recovery: {} } as any)
   const [matchCandidates, setMatchCandidates] = useState<Record<Phase, Array<any>>>({ ready: [], contact: [], recovery: [] } as any)
+  const [referenceLedger, setReferenceLedger] = useState<ReferenceObservation[]>([])
   const [autoResult, setAutoResult] = useState<PhaseResult | null>(null)
   const [refinement, setRefinement] = useState<RefinementResult | null>(null)
   const [localEvidence, setLocalEvidence] = useState<Array<{ phase: Phase; timestamp: number; extracted: boolean; poses: number; sources: string; poseIndex: number | null; score: number; second: number | null; rejection: string | null; geometry: boolean }>>([])
@@ -402,7 +403,7 @@ export default function PoseTestPage() {
 
   const resetVideoAnalysis = () => {
     setRefinedFrames([])
-    setAutoResult(null); setRefinement(null); setLocalEvidence([])
+    setReferenceLedger([]); setAutoResult(null); setRefinement(null); setLocalEvidence([])
     setAutoBusy(false)
     autoCache.current.clear()
     setSelectionOrigin({ ready: 'MANUAL', contact: 'MANUAL', recovery: 'MANUAL' })
@@ -444,7 +445,7 @@ export default function PoseTestPage() {
   }, [])
 
   const handleFileChange = (phase: Phase) => (event: ChangeEvent<HTMLInputElement>) => {
-    setAutoResult(null); setRefinement(null); setLocalEvidence([])
+    setReferenceLedger([]); setAutoResult(null); setRefinement(null); setLocalEvidence([])
     autoCache.current.clear()
     sourceGeneration.current += 1
     setPhaseVideoFingerprint((s) => ({ ...s, [phase]: null }))
@@ -864,7 +865,7 @@ export default function PoseTestPage() {
     if (!persistentAnchor || autoBusy) return
     const generation = ++sourceGeneration.current
     setAutoBusy(true)
-    setAutoResult(null); setRefinement(null); setLocalEvidence([])
+    setReferenceLedger([]); setAutoResult(null); setRefinement(null); setLocalEvidence([])
     autoCache.current.clear()
     setAnalyses({ ready: null, contact: null, recovery: null })
     setSelectedPoseIndex({ ready: null, contact: null, recovery: null })
@@ -916,6 +917,15 @@ export default function PoseTestPage() {
         candidates.push({ frameId: frame.frameId, timestamp: frame.timestampSeconds, targetScore: identity.score, matched: identity.accepted,
           ...(target ? phaseGeometry(target.landmarks, entry.image.naturalWidth / entry.image.naturalHeight, paddleHand) : { reach: null, wrist: null }) })
       }
+      setReferenceLedger(buildReferenceLedger(videoFile ? videoFingerprint(videoFile) : null, String(generation), anchorTime,
+        videoMeta!.width / videoMeta!.height, frames.map((frame) => {
+          const entry = autoCache.current.get(frame.frameId)!
+          return { frameId: frame.frameId, timestamp: frame.timestampSeconds, evidence: entry.identity!,
+            candidates: (entry.detection?.candidates ?? entry.poses).map((pose) => ({
+              poseIndex: pose.poseIndex, detectionSource: pose.detectionSource,
+              features: extractFeatures(pose, { width: entry.image.naturalWidth, height: entry.image.naturalHeight }),
+            })) }
+        })).records)
       const result = detectPhases(candidates)
       if (!result.proposals.length && candidates.some((c) => !c.matched)) result.reasons.unshift('UNRESOLVED — TARGET IDENTITY: insufficient continuous identity evidence may limit phase selection.')
       setAutoResult(result)
@@ -1280,7 +1290,7 @@ export default function PoseTestPage() {
         if (phase === 'ready') {
           const features = extractFeatures(pose, canvasSizes[phase])
           sourceGeneration.current += 1
-          setAutoResult(null); setRefinement(null); setLocalEvidence([])
+          setReferenceLedger([]); setAutoResult(null); setRefinement(null); setLocalEvidence([])
           setAutoBusy(false)
           autoCache.current.clear()
           setPersistentAnchor({ id: 'TARGET_A', features, timestamp: lastFrameMeta.ready?.timestampSeconds, poseIndex: pose.poseIndex, pose })
@@ -1530,7 +1540,7 @@ export default function PoseTestPage() {
               {frames.length > 0 && <section className="rounded-3xl border border-slate-700 bg-slate-950 p-6 space-y-3">
                 <h2 className="text-xl font-semibold">Automatic Phase Detection</h2>
                 <p className="text-sm text-slate-300">Assign one clear frame to Ready, analyze it, and click the physical player once to identify TARGET_A. Then scan the video. Manual assignment remains available.</p>
-                <label className="block">Paddle hand <select aria-label="Paddle hand" value={paddleHand} disabled={autoBusy} onChange={(e) => { setPaddleHand(e.target.value as 'left' | 'right'); setAutoResult(null); setRefinement(null); setLocalEvidence([]); autoCache.current.clear() }} className="bg-slate-800 p-2"><option value="right">Right</option><option value="left">Left</option></select></label>
+                <label className="block">Paddle hand <select aria-label="Paddle hand" value={paddleHand} disabled={autoBusy} onChange={(e) => { setPaddleHand(e.target.value as 'left' | 'right'); setReferenceLedger([]); setAutoResult(null); setRefinement(null); setLocalEvidence([]); autoCache.current.clear() }} className="bg-slate-800 p-2"><option value="right">Right</option><option value="left">Left</option></select></label>
                 <button type="button" disabled={!persistentAnchor || autoBusy || extracting || phases.some((p) => loading[p])} onClick={runAutomaticPhases} className="rounded bg-emerald-600 p-3 disabled:opacity-40">{autoBusy ? 'Scanning / analyzing…' : 'Propose automatic phases'}</button>
                 {autoResult && <>
                   <button type="button" disabled={autoBusy || autoResult.proposals.length !== 3} onClick={runLocalRefinement} className="rounded border border-emerald-500 p-3 disabled:opacity-40">Refine local phase timing</button>
@@ -1548,6 +1558,16 @@ export default function PoseTestPage() {
                   </div>)}</div></details>}
                   {autoResult.reasons.map((reason) => <p key={reason} className="text-sm text-amber-200">{reason}</p>)}
                   {!autoResult.proposals.length && <p>Unresolved — keep manual selection.</p>}
+                  <details className="text-xs border border-slate-600 p-2">
+                    <summary>Reference provenance — shadow diagnostics only ({referenceLedger.length} observations)</summary>
+                    <p>Qualification does not change authorization. Competitors have no persistent identity; qualified observations are not independent identity evidence.</p>
+                    {(['target', 'competitor'] as const).map((role) => {
+                      const rows = referenceLedger.filter((r) => r.role === role)
+                      return <div key={role}><p>{role}: total {rows.length} · trusted {rows.filter((r) => r.identityStatus === 'trusted-target').length} · qualified {rows.filter((r) => r.qualification === 'qualified').length} · unusable {rows.filter((r) => r.qualification === 'unusable').length} · unresolved identity {rows.filter((r) => r.physicalIdentity === null).length}</p>
+                        {rows.map((r) => <details key={r.candidateId}><summary>{r.timestamp.toFixed(3)}s · {r.detectionSource ?? 'unknown source'} · {r.direction} · segment {r.segment} · {r.qualification}</summary><pre className="whitespace-pre-wrap">{JSON.stringify(r, null, 2)}</pre></details>)}
+                      </div>
+                    })}
+                  </details>
                   <div className="grid gap-4 md:grid-cols-3">{displayProposals.map((proposal) => {
                     const frame = phaseFrames.find((f) => f.frameId === proposal.frameId)!
                     const entry = autoCache.current.get(proposal.frameId)
@@ -1661,7 +1681,7 @@ export default function PoseTestPage() {
                             if (phase === 'ready') {
                               sourceGeneration.current += 1
                               setPersistentAnchor(null)
-                              setAutoResult(null); setRefinement(null); setLocalEvidence([])
+                              setReferenceLedger([]); setAutoResult(null); setRefinement(null); setLocalEvidence([])
                               autoCache.current.clear()
                             }
                             setSelectionOrigin((s) => overridePhase(s, phase, 'MANUAL OVERRIDE'))

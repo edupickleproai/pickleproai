@@ -633,3 +633,88 @@ test('prerequisites: degenerate torso and limb report their actual failure',()=>
     assert.equal(q.eligible,false)
   }
 })
+
+const { buildReferenceLedger } = mod.exports
+function ledgerFrame(time=0, index=1, reason='User-selected physical player anchor') {
+  const features=rqPlayer()
+  return {frameId:'f'+time,timestamp:time,candidates:[{poseIndex:index,features,detectionSource:'FULL_FRAME'},{poseIndex:9,features:rqPlayer(.8,true)}],
+    evidence:{accepted:true,poseIndex:index,score:1,reason,observation:{timestamp:time,features,segment:0}}}
+}
+const ledger=(frames)=>buildReferenceLedger('video','run',0,1,frames)
+test('ledger: trusted target and manual anchor provenance are explicit',()=>{
+  const r=ledger([ledgerFrame()]).records[0]
+  assert.equal(r.identityStatus,'trusted-target'); assert.equal(r.physicalIdentity,'TARGET_A')
+  assert.equal(r.acceptanceOrigin,'User-selected physical player anchor')
+  assert.equal(r.videoId,'video'); assert.equal(r.runId,'run'); assert.equal(r.direction,'anchor')
+})
+test('ledger: existing geometry qualifies target without authorization changes',()=>{
+  assert.equal(ledger([ledgerFrame()]).qualifiedTargets.length,1)
+})
+test('ledger: low-quality accepted target remains trusted but unusable',()=>{
+  const f=ledgerFrame(); f.candidates[0].features.landmarks[13].visibility=.2
+  const r=ledger([f]).records[0]
+  assert.equal(r.identityStatus,'trusted-target'); assert.equal(r.qualification,'unusable')
+  assert.equal(r.shadowReferenceEligible,false)
+  assert.deepEqual(r.qualityFailures,['LANDMARK_13_INSUFFICIENT_VISIBILITY'])
+})
+for(const state of ['REACQUISITION_PENDING_CONFIRMATION','REACQUISITION_REJECTED','UNRESOLVED']) {
+  test('ledger: excludes '+state,()=>{
+    const f=ledgerFrame(); f.evidence={accepted:false,poseIndex:null,score:0,reason:state}
+    assert.equal(ledger([f]).records.length,0)
+  })
+}
+test('ledger: unusable competitors retained with exact failures and unresolved identity',()=>{
+  const f=ledgerFrame(); f.candidates[1].features.landmarks[15].visibility=.1
+  const r=ledger([f]).records[1]
+  assert.equal(r.qualification,'unusable'); assert.equal(r.physicalIdentity,null)
+  assert.equal(r.identityStatus,'unresolved-competitor')
+  assert.deepEqual(r.qualityFailures,['LANDMARK_15_INSUFFICIENT_VISIBILITY'])
+})
+test('ledger: competitors never acquire persistent identity across timestamps',()=>{
+  const rows=ledger([ledgerFrame(),ledgerFrame(.55)]).records.filter(r=>r.role==='competitor')
+  assert.equal(rows.length,2); assert.ok(rows.every(r=>r.physicalIdentity===null))
+  assert.notEqual(rows[0].candidateId,rows[1].candidateId)
+})
+test('ledger: pose permutation changes only frame-local candidate label',()=>{
+  const a=ledger([ledgerFrame()]).records[0], b=ledger([ledgerFrame(0,7)]).records[0]
+  assert.notEqual(a.candidateId,b.candidateId)
+  assert.deepEqual({...a,candidateId:null},{...b,candidateId:null})
+})
+test('ledger: repeated frames and deduplicated candidates do not inflate view',()=>{
+  const f=ledgerFrame(); f.candidates.push(f.candidates[0])
+  assert.equal(ledger([f,f]).qualifiedTargets.length,1)
+  const other=ledgerFrame(); other.frameId='alternate-source'
+  assert.equal(ledger([f,other]).qualifiedTargets.length,1)
+})
+test('ledger: direction segment and missing source preserved honestly',()=>{
+  const f=ledgerFrame(-.55); f.evidence.observation.segment=-1
+  const r=ledger([f]).records
+  assert.equal(r[0].direction,'backward'); assert.equal(r[0].segment,-1)
+  assert.equal(r[1].detectionSource,null)
+  assert.equal(ledger([ledgerFrame(.55)]).records[0].direction,'forward')
+})
+test('ledger: pure collection cannot alter tracking or scorer inputs',()=>{
+  const f=ledgerFrame(), before=JSON.stringify(f)
+  const prior=rqStep(3,[rqCandidate()])
+  ledger([f])
+  assert.equal(JSON.stringify(f),before)
+  assert.deepEqual(rqStep(3,[rqCandidate()]),prior)
+})
+test('ledger: confirmed target retained but pending history and confirmation negatives not enrolled',()=>{
+  const rows=ledger([ledgerFrame(3,1,'REACQUISITION_CONFIRMED')]).records
+  assert.equal(rows.length,1); assert.equal(rows[0].role,'target')
+})
+test('checkpoint equivalence: tracking lock reacquisition and phases unchanged',()=>{
+  const {execFileSync}=require('node:child_process')
+  const source=execFileSync('git',['show','ac157033e80bf1fee3008a07c88b8dac3d452a70:src/lib/phase-detection.ts'],{encoding:'utf8'})
+  const baseline=new Module(filename,module)
+  baseline._compile(ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText,filename)
+  const frames=[{frameId:'trusted',timestamp:.55,candidates:[rqCandidate(1,.31)]},{frameId:'gap',timestamp:2,candidates:[]},
+    ...[3,3.55,4.1].map((timestamp,i)=>({frameId:'r'+i,timestamp,candidates:[rqCandidate(i+2,.6+i*.01)]}))]
+  const run=(m)=>{const d=[]; const e=m.trackIdentity({timestamp:0,features:rqPlayer()},frames,1,(id,v)=>d.push([id,v]),{competitors:rqNegatives()}); return {e:[...e],d}}
+  assert.deepEqual(run(mod.exports),run(baseline.exports))
+  for(const candidates of [[],[rqCandidate()],[rqCandidate(2,.6,true)],[rqCandidate(),rqCandidate(4)]])
+    assert.deepEqual(rqStep(3,candidates),baseline.exports.evaluateReacquisition(rqTrusted(),rqNegatives(),3,candidates,1))
+  const phases=Array.from({length:12},(_,i)=>({frameId:'p'+i,timestamp:i*.55,targetScore:1,matched:true,reach:Math.sin(i)+2,wrist:{x:i*.1,y:Math.sin(i)}}))
+  assert.deepEqual(detectPhases(phases),baseline.exports.detectPhases(phases))
+})

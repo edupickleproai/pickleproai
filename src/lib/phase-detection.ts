@@ -504,3 +504,52 @@ export function refinePhases(coarse: PhaseResult, input: PhaseCandidate[], plan:
       : best.proposals[i].score < baseline.proposals[i].score + 0.04 ? 'Local challenger does not improve this phase by 0.040; coarse retained.'
       : 'Coarse retained to preserve a valid ordered, unique mixed sequence.' })) }
 }
+
+// Shadow provenance only. This view is never an input to tracking or reacquisition.
+export type ReferenceObservation = {
+  videoId: string | null; runId: string | null; frameId: string; timestamp: number
+  role: 'target' | 'competitor'; candidateId: string; detectionSource: string | null
+  coordinates: 'full-frame-normalized-image'; aspect: number
+  direction: 'anchor' | 'forward' | 'backward'; segment: number
+  acceptanceOrigin: string; identityStatus: 'trusted-target' | 'unresolved-competitor'
+  targetTrustedAtCollection: true; physicalIdentity: 'TARGET_A' | null
+  qualification: 'qualified' | 'unusable'; qualityFailures: string[]
+  shadowReferenceEligible: boolean; supportingFrameId: string
+  // Distinct timestamps are not a claim of independent identity evidence.
+  duplicateTimestamp: boolean
+}
+export type ReferenceLedgerFrame = {
+  frameId: string; timestamp: number; evidence: IdentityEvidence
+  candidates: Array<IdentityCandidate & { detectionSource?: string }>
+}
+export function buildReferenceLedger(videoId: string | null, runId: string | null, anchorTime: number,
+  aspect: number, frames: ReferenceLedgerFrame[]) {
+  const records: ReferenceObservation[] = []
+  const seen = new Set<string>(), targetTimes = new Set<number>()
+  for (const frame of [...frames].sort((a, b) => a.timestamp - b.timestamp || a.frameId.localeCompare(b.frameId))) {
+    const e = frame.evidence
+    if (!e.accepted || e.poseIndex === null || !e.observation) continue
+    for (const candidate of frame.candidates) {
+      const target = candidate.poseIndex === e.poseIndex
+      // Match the existing collector: confirmation itself does not enroll negatives.
+      if (!target && e.reason === 'REACQUISITION_CONFIRMED') continue
+      const key = `${frame.frameId}:${candidate.poseIndex}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      const qualityFailures: string[] = []
+      const qualified = reacquisitionGeometry(candidate.features, aspect, qualityFailures) !== null
+      const duplicateTimestamp = target && targetTimes.has(frame.timestamp)
+      if (target) targetTimes.add(frame.timestamp)
+      records.push({ videoId, runId, frameId: frame.frameId, timestamp: frame.timestamp,
+        role: target ? 'target' : 'competitor', candidateId: key,
+        detectionSource: candidate.detectionSource ?? null, coordinates: 'full-frame-normalized-image', aspect,
+        direction: frame.timestamp === anchorTime ? 'anchor' : frame.timestamp > anchorTime ? 'forward' : 'backward',
+        segment: e.observation.segment ?? 0, acceptanceOrigin: e.reason,
+        identityStatus: target ? 'trusted-target' : 'unresolved-competitor', targetTrustedAtCollection: true,
+        physicalIdentity: target ? 'TARGET_A' : null, qualification: qualified ? 'qualified' : 'unusable', qualityFailures,
+        shadowReferenceEligible: target && qualified && !duplicateTimestamp,
+        supportingFrameId: frame.frameId, duplicateTimestamp })
+    }
+  }
+  return { records, qualifiedTargets: records.filter((r) => r.shadowReferenceEligible) }
+}
