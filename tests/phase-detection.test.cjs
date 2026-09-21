@@ -998,3 +998,158 @@ test('competitor: authoritative library and acquisition handler unchanged agains
   const handler=s=>s.slice(s.indexOf('  const runTargetAcquisition'),s.indexOf('  const acceptAutomaticPhases'))
   assert.equal(handler(after),handler(before))
 })
+
+const { assessShadowEligibility }=mod.exports
+function shFixture({poorCompetitor=false}={}) {
+  const supports=[aqSupport(0),aqSupport(.55,.31)]
+  supports[1].evidence.observation.features.landmarks[15].visibility=.2
+  const plan=planTargetAcquisition(supports)
+  const frames=supports.map(s=>({...s,candidates:[{poseIndex:1,features:s.evidence.observation.features,detectionSource:'FULL_FRAME'},
+    {poseIndex:2,features:rqPlayer(.7,true),detectionSource:'FULL_FRAME'}]}))
+  if(poorCompetitor)frames[0].candidates[1].features.landmarks[15].visibility=.2
+  const references=buildReferenceLedger('video','run',-1,1,frames).records
+  const observations=[aqObserve(plan)]
+  const diagnostic=evaluateReacquisition(supports.map(s=>s.evidence.observation),frames.flatMap(f=>[f.candidates[1].features]),2,[rqCandidate()],1).diagnostic
+  const competitors=buildCompetitorProvenance('video','run',-1,1,frames)
+  return {decision:{frameId:'decision',timestamp:2,direction:'forward',candidateCount:1,diagnostic},references,
+    acquisition:{plan,observations},competitors}
+}
+const sh=f=>assessShadowEligibility(f??shFixture())
+test('shadow: qualified harvested target enters proposed pool',()=>{
+  const a=sh();assert.equal(a.target.pool.filter(r=>r.origin==='harvested').length,1)
+})
+for(const status of ['unusable','unassociated','extraction-failure','detection-failure'])test('shadow: excludes harvest '+status,()=>{
+  const f=shFixture();f.acquisition.observations[0].status=status
+  assert.equal(sh(f).target.pool.filter(r=>r.origin==='harvested').length,0)
+})
+test('shadow: raw count never establishes independence',()=>{
+  const a=sh();assert.ok(a.target.pool.length>=2);assert.equal(a.target.viewB.satisfied,false)
+  assert.equal(a.proposedConservativeEligibility,false)
+})
+test('shadow: same bracket observations share support group',()=>{
+  const f=shFixture(),bracket=f.acquisition.plan.brackets[0]
+  f.acquisition.observations.push(assessAcquiredTarget(bracket,bracket.timestamps[1],[rqCandidate(7,.305)],1,aqContext))
+  assert.ok(f.acquisition.observations.every(o=>o.status==='qualified'))
+  assert.ok(sh(f).target.relationships.some(r=>r.labels.includes('SAME_SUPPORT_GROUP')))
+})
+test('shadow: different brackets sharing endpoint remain related',()=>{
+  const supports=[aqSupport(0),aqSupport(.55),aqSupport(1.1)],plan=planTargetAcquisition(supports),f=shFixture()
+  f.references=buildReferenceLedger('video','run',-1,1,supports.map(s=>({...s,candidates:[rqCandidate(1,.3)]}))).records
+  f.acquisition={plan,observations:plan.brackets.map(b=>assessAcquiredTarget(b,b.timestamps[0],[rqCandidate(7,.3)],1,aqContext))}
+  assert.ok(f.acquisition.observations.every(o=>o.status==='qualified'))
+  assert.ok(sh(f).target.relationships.some(r=>r.labels.includes('SHARED_ENDPOINT_RELATED')))
+})
+test('shadow: temporal proximity is relatedness not independence',()=>{
+  assert.ok(sh().target.relationships.some(r=>r.labels.includes('TEMPORALLY_CLOSE_RELATED')&&r.labels.includes('INDEPENDENCE_UNESTABLISHED')))
+})
+test('shadow: duplicate timestamp and source adds no numerical vote',()=>{
+  const f=shFixture(),n=sh(f).target.pool.length;f.acquisition.observations.push(structuredClone(f.acquisition.observations[0]))
+  assert.equal(sh(f).target.pool.length,n)
+})
+test('shadow: distinct support candidates are not independent',()=>{
+  const f=shFixture(),r=structuredClone(f.references.find(r=>r.role==='target'&&r.qualification==='qualified'))
+  r.frameId='separate';r.candidateId='separate:1';r.timestamp=1.5;f.references.push(r)
+  assert.ok(sh(f).target.relationships.some(r=>r.labels.includes('DISTINCT_SUPPORT_CANDIDATE')))
+  assert.equal(sh(f).target.viewB.satisfied,false)
+})
+test('shadow: View A passes while conservative View B blocks',()=>{
+  const a=sh();assert.equal(a.target.viewA.satisfied,true);assert.deepEqual(a.target.viewB.blockers,['INDEPENDENCE_UNESTABLISHED'])
+})
+test('shadow: future target observation is excluded',()=>{
+  const f=shFixture();f.decision.timestamp=.05
+  assert.ok(sh(f).target.observations.some(r=>r.origin==='harvested'&&r.reasons.includes('NOT AVAILABLE AT DECISION TIME')))
+})
+test('shadow: future bracket endpoint prevents retrospective support',()=>{
+  const f=shFixture();f.decision.timestamp=.2
+  assert.equal(sh(f).target.pool.filter(r=>r.origin==='harvested').length,0)
+})
+test('shadow: directly qualified competitor remains directly qualified',()=>{
+  assert.ok(sh().competitor.obligations.every(o=>o.status==='DIRECT_QUALIFIED'))
+})
+test('shadow: same continuous segment supplies separate coverage relationship',()=>{
+  const f=shFixture({poorCompetitor:true}),a=sh(f)
+  assert.equal(a.competitor.obligations[0].status,'SAME_SEGMENT_QUALIFIED_COVERAGE')
+  assert.equal(a.competitor.obligations[0].currentUsable,false)
+  assert.equal(a.competitor.obligations[0].candidates[0].path.length,2)
+})
+test('shadow: different segment cannot cover competitor',()=>{
+  const f=shFixture({poorCompetitor:true});f.competitors.observations[1].segmentId='different'
+  assert.equal(sh(f).competitor.obligations[0].status,'NO_QUALIFIED_COVERAGE')
+})
+test('shadow: unresolved identity obligation cannot be discharged',()=>{
+  const f=shFixture({poorCompetitor:true});f.competitors.observations[0].segmentId=null
+  assert.equal(sh(f).competitor.obligations[0].status,'UNRESOLVED_IDENTITY')
+})
+test('shadow: current unknown inventory remains an explicit blocker',()=>{
+  assert.ok(sh().stages[3].blockers.includes('UNKNOWN_COMPETITOR_INVENTORY'))
+})
+test('shadow: future competitor coverage excluded at decision',()=>{
+  const f=shFixture({poorCompetitor:true});f.decision.timestamp=.3
+  // Historical snapshot at .3 includes only the first competitor.
+  const q=f.decision.diagnostic.prerequisites;q.competitor.available=1;q.references=q.references.filter(r=>r.kind!=='competitor'||r.index===0)
+  const o=sh(f).competitor.obligations[0]
+  assert.equal(o.status,'NO_QUALIFIED_COVERAGE');assert.equal(o.candidates[0].causality,'NOT AVAILABLE AT DECISION TIME')
+})
+test('shadow: coverage never mutates history or current diagnostics',()=>{
+  const f=shFixture({poorCompetitor:true}),before=structuredClone(f);sh(f);assert.deepEqual(f,before)
+})
+test('shadow: Stage 1 changes while Stage 0 stays blocked',()=>{
+  const a=sh();assert.equal(a.stages[0].eligible,false);assert.equal(a.stages[1].eligible,true)
+  assert.equal(a.stages[1].scoring,'WOULD_BE_ALLOWED_TO_SCORE')
+})
+test('shadow: Stage 2 reblocks count-only Stage 1',()=>{
+  const a=sh();assert.equal(a.stages[1].eligible,true);assert.equal(a.stages[2].eligible,false)
+  assert.ok(a.stages[2].addedBlockers.includes('INDEPENDENCE_UNESTABLISHED'))
+})
+test('shadow: Stage 3 alters only competitor blockers',()=>{
+  const a=sh(shFixture({poorCompetitor:true}));assert.ok(a.stages[3].blockers.includes('INDEPENDENCE_UNESTABLISHED'))
+  assert.ok(a.stages[3].removedBlockers.includes('COMPETITOR_REFERENCES_UNUSABLE'))
+})
+test('shadow: no candidate scoring or pending/confirmed output',()=>{
+  const a=sh();assert.equal(a.authority,'NONE');assert.equal(a.hypothesis,undefined);assert.equal(a.evidence,undefined)
+  assert.equal(a.current.eligible,false)
+})
+test('shadow: unsupported bracket excluded even if harvest says qualified',()=>{
+  const f=shFixture();f.acquisition.observations[0].bracketId='unsupported'
+  assert.equal(sh(f).target.pool.filter(r=>r.origin==='harvested').length,0)
+})
+test('shadow: reacquired target cannot create circular authority',()=>{
+  const f=shFixture();f.references[0].acceptanceOrigin='REACQUISITION_CONFIRMED'
+  assert.equal(sh(f).target.pool.length,0)
+})
+test('shadow: pose index permutation does not affect group structure',()=>{
+  const f=shFixture(),a=sh(f);f.references.forEach(r=>r.candidateId=r.frameId+':99')
+  const b=sh(f);assert.deepEqual(a.target.relationships.map(r=>r.labels),b.target.relationships.map(r=>r.labels))
+})
+test('shadow: crop/full-frame source never establishes independence',()=>{
+  const f=shFixture();f.acquisition.observations[0].reference.detectionSource='LEFT_CROP'
+  assert.equal(sh(f).target.viewB.satisfied,false)
+})
+test('shadow: missing recorded prerequisites are explicit, not reconstructed by scoring',()=>{
+  const f=shFixture();delete f.decision.diagnostic.prerequisites;f.decision.candidateCount=0
+  assert.ok(sh(f).stages.every(s=>!s.eligible));assert.ok(sh(f).stages[0].blockers.includes('CURRENT_PREREQUISITES_NOT_RECORDED'))
+})
+test('shadow: backward evidence later in video is unavailable at earlier video decision',()=>{
+  const f=shFixture();f.decision.direction='backward';f.decision.timestamp=-1
+  assert.equal(sh(f).target.pool.length,0)
+})
+test('shadow: assessment and diagnostics cannot call authoritative scorer',()=>{
+  const source=fs.readFileSync(filename,'utf8').split('// Assessment only:')[1]
+  for(const forbidden of ['evaluateReacquisition(', 'trackIdentity(', 'refineIdentity(', 'detectPhases('])assert.equal(source.includes(forbidden),false)
+})
+test('shadow: authoritative outputs and prior shadow outputs equal 3.0.11c checkpoint',()=>{
+  const {execFileSync}=require('node:child_process'),base='130c5d5a8a1eaeffef47438f0ad25c791d09c652'
+  const read=f=>execFileSync('git',['show',base+':'+f],{encoding:'utf8'}).replace(/\r\n/g,'\n')
+  const source=read('src/lib/phase-detection.ts'),baseline=new Module(filename,module)
+  baseline._compile(ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText,filename)
+  assert.ok(fs.readFileSync(filename,'utf8').replace(/\r\n/g,'\n').startsWith(source.trimEnd()))
+  const old=baseline.exports,frames=[cpFrame(0),cpFrame(.55),cpDecision()]
+  assert.deepEqual(cp(frames),old.buildCompetitorProvenance('video','run',0,1,frames))
+  assert.deepEqual(evaluateReacquisition(rqTrusted(),rqNegatives(),3,[rqCandidate()],1),old.evaluateReacquisition(rqTrusted(),rqNegatives(),3,[rqCandidate()],1))
+  assert.deepEqual(trackIdentity({timestamp:0,features:rqPlayer()},frames,1),old.trackIdentity({timestamp:0,features:rqPlayer()},frames,1))
+  assert.deepEqual(aqPlan(),old.planTargetAcquisition([aqSupport(0),aqSupport(.55,.31)]))
+  assert.deepEqual(aqObserve(),old.assessAcquiredTarget(aqPlan().brackets[0],aqPlan().brackets[0].timestamps[0],[rqCandidate(7,.305)],1,aqContext))
+  assert.deepEqual(detectPhases([]),old.detectPhases([]))
+  for(const f of ['src/lib/coaching-biomechanics.ts','src/app/pose-test/BiomechanicsPanel.tsx','src/app/api/coach/route.ts','src/app/api/video-analysis/route.ts'])
+    assert.equal(fs.readFileSync(path.resolve(__dirname,'..',f),'utf8').replace(/\r\n/g,'\n'),read(f))
+})

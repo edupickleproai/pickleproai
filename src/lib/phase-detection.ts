@@ -808,3 +808,146 @@ export function buildCompetitorProvenance(videoId: string | null, runId: string 
   return { observations, segments, exclusions, coverage,
     unresolvedObligations: observations.filter((o) => o.association === 'unresolved').map((o) => o.reference.candidateId) }
 }
+
+// Assessment only: consumes recorded decisions, never invokes the identity scorer.
+export type ShadowDecision = {
+  frameId: string; timestamp: number; direction: 'forward' | 'backward'
+  candidateCount: number; diagnostic: IdentityDiagnostic
+}
+export function assessShadowEligibility(input: {
+  decision: ShadowDecision; references: ReferenceObservation[]
+  acquisition: { plan: ReturnType<typeof planTargetAcquisition>; observations: AcquiredTarget[] } | null
+  competitors: ReturnType<typeof buildCompetitorProvenance>
+}) {
+  const { decision: d, references, acquisition, competitors } = input
+  const current = d.diagnostic.prerequisites
+  const before = (time: number) => Number.isFinite(time) && Number.isFinite(d.timestamp) && time < d.timestamp
+  const stream = (r: ReferenceObservation) => r.direction === 'anchor' || r.direction === d.direction
+  const causal = (times: number[]) => times.every(before)
+  const targets: Array<{ reference: ReferenceObservation; origin: 'existing' | 'harvested';
+    endpoints: string[]; supportTimestamps: number[]; bracket: string | null; geometry: number[] | null;
+    causality: 'PASS' | 'NOT AVAILABLE AT DECISION TIME'; available: boolean; reasons: string[] }> = []
+  const safeTarget = (r: ReferenceObservation) => r.role === 'target' && r.physicalIdentity === 'TARGET_A'
+    && r.identityStatus === 'trusted-target' && r.targetTrustedAtCollection && r.segment === 0
+    && r.qualification === 'qualified' && !r.qualityFailures.length
+    && !/REACQUISITION|PENDING/.test(r.acceptanceOrigin)
+  for (const r of references.filter((r) => r.role === 'target')) {
+    const reasons = [...(!safeTarget(r) ? ['UNQUALIFIED_OR_CIRCULAR_TARGET'] : []),
+      ...(!stream(r) ? ['OTHER_TRACKING_DIRECTION'] : []), ...(!before(r.timestamp) ? ['NOT AVAILABLE AT DECISION TIME'] : [])]
+    targets.push({ reference: r, origin: 'existing', endpoints: [r.frameId], supportTimestamps: [r.timestamp],
+      causality: before(r.timestamp) ? 'PASS' : 'NOT AVAILABLE AT DECISION TIME', bracket: null, geometry: null,
+      available: reasons.length === 0, reasons })
+  }
+  for (const a of acquisition?.observations ?? []) {
+    if (!a.reference) continue
+    const r = a.reference
+    const bracket = acquisition!.plan.brackets.find((b) => b.id === a.bracketId)
+    // Revalidate the frozen support structure, not just a caller-provided status.
+    const validBracket = bracket && planTargetAcquisition([bracket.left, bracket.right]).brackets.some((b) => b.id === bracket.id)
+      && bracket.timestamps.includes(a.timestamp) && a.timestamp > bracket.left.timestamp && a.timestamp < bracket.right.timestamp
+      && bracket.direction === a.direction && bracket.segment === a.segment
+      && [bracket.left, bracket.right].every((s) => references.some((v) => v.role === 'target'
+        && v.frameId === s.frameId && v.timestamp === s.timestamp && v.segment === 0
+        && v.videoId === a.videoId && v.runId === a.runId && v.targetTrustedAtCollection
+        && !/REACQUISITION|PENDING/.test(v.acceptanceOrigin)))
+      && a.supportingEndpoints.left.frameId === bracket.left.frameId && a.supportingEndpoints.right.frameId === bracket.right.frameId
+      && a.supportingEndpoints.left.timestamp === bracket.left.timestamp && a.supportingEndpoints.right.timestamp === bracket.right.timestamp
+    const times = [a.timestamp, a.supportingEndpoints.left.timestamp, a.supportingEndpoints.right.timestamp]
+    const reasons = [...(a.status !== 'qualified' || !safeTarget(r) || !a.geometry?.length || !a.geometry.every(Number.isFinite)
+      ? ['UNQUALIFIED_HARVEST'] : []), ...(!validBracket ? ['UNSUPPORTED_BRACKET'] : []),
+      ...(a.direction !== d.direction ? ['OTHER_TRACKING_DIRECTION'] : []),
+      ...(r.timestamp !== a.timestamp || r.videoId !== a.videoId || r.runId !== a.runId ? ['PROVENANCE_MISMATCH'] : []),
+      ...(!causal(times) ? ['NOT AVAILABLE AT DECISION TIME'] : [])]
+    targets.push({ reference: r, origin: 'harvested', endpoints: [a.supportingEndpoints.left.frameId, a.supportingEndpoints.right.frameId],
+      supportTimestamps: times, causality: causal(times) ? 'PASS' : 'NOT AVAILABLE AT DECISION TIME',
+      bracket: a.bracketId, geometry: a.geometry, available: reasons.length === 0, reasons })
+  }
+  const pool = targets.filter((t) => t.available).filter((t, i, all) => all.findIndex((v) =>
+    v.reference.timestamp === t.reference.timestamp) === i)
+  const duplicates = targets.filter((t) => t.available).flatMap((t, i, all) => all.slice(0, i)
+    .filter((v) => v.reference.timestamp === t.reference.timestamp).map((v) => ({
+      left: v.reference.candidateId, right: t.reference.candidateId, timestamp: t.reference.timestamp,
+      sameSource: v.reference.detectionSource === t.reference.detectionSource, reason: 'DUPLICATE_TIMESTAMP_NO_ADDITIONAL_VOTE' })))
+  // Use the existing local support horizon as a relatedness flag, NEVER as an independence threshold.
+  const relationships = pool.flatMap((a, i) => pool.slice(i + 1).map((b) => {
+    const shared = a.endpoints.filter((id) => b.endpoints.includes(id))
+    const temporalDistance = Math.abs(a.reference.timestamp - b.reference.timestamp)
+    const sameStream = a.reference.segment === b.reference.segment && a.reference.direction === b.reference.direction
+    const labels = [a.bracket && a.bracket === b.bracket ? 'SAME_SUPPORT_GROUP' : shared.length ? 'SHARED_ENDPOINT_RELATED' : 'DISTINCT_SUPPORT_CANDIDATE',
+      ...(temporalDistance <= 1.2 ? ['TEMPORALLY_CLOSE_RELATED'] : []), 'INDEPENDENCE_UNESTABLISHED']
+    const geometryDistance = a.geometry && b.geometry && a.geometry.length === b.geometry.length
+      ? Math.sqrt(a.geometry.reduce((sum, v, j) => sum + (v - b.geometry![j]) ** 2, 0) / a.geometry.length) : null
+    return { left: a.reference.candidateId, right: b.reference.candidateId, labels, sharedEndpoints: shared,
+      temporalDistance, sameStream, origins: [a.origin, b.origin], sameSource: a.reference.detectionSource === b.reference.detectionSource,
+      geometryDistance }
+  }))
+  const groups: string[][] = pool.map((p) => [p.reference.candidateId])
+  for (const r of relationships.filter((r) => r.sharedEndpoints.length || r.temporalDistance <= 1.2)) {
+    const a = groups.findIndex((g) => g.includes(r.left)), b = groups.findIndex((g) => g.includes(r.right))
+    if (a !== b) { groups[a].push(...groups[b]); groups.splice(b, 1) }
+  }
+  const required = current?.target.required ?? 2
+  const viewA = { satisfied: pool.length >= required, usable: pool.length, required,
+    ignoresIndependence: true, blockers: pool.length >= required ? [] : ['INSUFFICIENT_USABLE_TARGET_REFERENCES'] }
+  const viewB = { satisfied: false, groups, independence: 'INDEPENDENCE_UNESTABLISHED',
+    blockers: [...viewA.blockers, 'INDEPENDENCE_UNESTABLISHED'] }
+  // Recover the historical collector's directional order; never substitute a current detected player.
+  const historical = references.filter((r) => r.role === 'competitor' && stream(r))
+    .filter((r) => r.direction === 'anchor' || (d.timestamp - r.timestamp) * (d.direction === 'forward' ? 1 : -1) > 0)
+    .sort((a, b) => Number(b.direction === 'anchor') - Number(a.direction === 'anchor')
+      || (d.direction === 'forward' ? 1 : -1) * (a.timestamp - b.timestamp))
+  const obligations = (current?.references.filter((r) => r.kind === 'competitor') ?? []).map((audit, i) => {
+    const r = historical[i]
+    const o = r && competitors.observations.find((o) => o.reference.candidateId === r.candidateId)
+    const segment = o && competitors.segments.find((s) => s.id === o.segmentId)
+    const index = segment && r ? segment.observations.indexOf(r.candidateId) : -1
+    const later = segment && index! >= 0 ? segment.observations.slice(index! + 1).map((id) => competitors.observations.find((o) => o.reference.candidateId === id)) : []
+    const candidates = later.filter((v) => v?.reference.qualification === 'qualified').map((v) => {
+      const end = segment!.observations.indexOf(v!.reference.candidateId)
+      const path = segment!.observations.slice(index!, end + 1)
+      const nodes = path.map((id) => competitors.observations.find((o) => o.reference.candidateId === id)!)
+      const continuous = nodes.every((n, j) => n && n.segmentId === o!.segmentId && n.reference.targetTrustedAtCollection
+        && n.reference.videoId === r.videoId && n.reference.runId === r.runId
+        && (n.reference.direction === r.direction || r.direction === 'anchor' && n.reference.direction === d.direction)
+        && (j === 0 || n.predecessor === path[j - 1] && n.association === 'locally-associated'))
+      return { observation: v!.reference.candidateId, timestamp: v!.reference.timestamp, path, continuous,
+        causality: nodes.every((n) => n && before(n.reference.timestamp)) ? 'PASS' : 'NOT AVAILABLE AT DECISION TIME' }
+    })
+    const mappingValid = !!r && historical.length === current!.competitor.available && r.qualification === (audit.usable ? 'qualified' : 'unusable')
+      && JSON.stringify(r.qualityFailures) === JSON.stringify(audit.reasons)
+    const covering = candidates.find((c) => c.continuous && c.causality === 'PASS')
+    const status = !mappingValid ? 'UNKNOWN_COMPETITOR_INVENTORY' : !before(r.timestamp) ? 'UNRESOLVED_CONTINUITY'
+      : audit.usable ? 'DIRECT_QUALIFIED' : !o?.segmentId ? 'UNRESOLVED_IDENTITY'
+      : covering ? 'SAME_SEGMENT_QUALIFIED_COVERAGE' : 'NO_QUALIFIED_COVERAGE'
+    return { index: audit.index, observation: r?.candidateId ?? null, timestamp: r?.timestamp ?? null,
+      originalFailures: [...audit.reasons], currentUsable: audit.usable, segmentId: o?.segmentId ?? null,
+      causality: r && before(r.timestamp) ? 'PASS' : 'NOT AVAILABLE AT DECISION TIME', status, candidates,
+      coveringObservation: status === 'SAME_SEGMENT_QUALIFIED_COVERAGE' ? covering?.observation ?? null : null }
+  })
+  // Historical references cannot prove the inventory of players at this decision.
+  const competitorBlockers = ['UNKNOWN_COMPETITOR_INVENTORY',
+    ...obligations.filter((o) => !['DIRECT_QUALIFIED', 'SAME_SEGMENT_QUALIFIED_COVERAGE'].includes(o.status)).map((o) => `${o.observation ?? o.index}:${o.status}`)]
+  const common = [...(!Number.isFinite(d.timestamp) ? ['INVALID_REACQUISITION_TIMESTAMP'] : []),
+    ...(d.candidateCount <= 0 ? ['NO_CANDIDATE'] : [])]
+  const currentCompetitor = !current ? ['CURRENT_PREREQUISITES_NOT_RECORDED'] : [
+    ...(current.competitor.available < current.competitor.required ? ['INSUFFICIENT_COMPETITOR_REFERENCES'] : []),
+    ...(!current.competitor.allUsable ? ['COMPETITOR_REFERENCES_UNUSABLE'] : [])]
+  const stage = (id: number, blockers: string[], previous: string[]) => {
+    const unique = [...new Set(blockers)]
+    return { stage: id, eligible: unique.length === 0, blockers: unique,
+      scoring: unique.length ? 'BLOCKED' : 'WOULD_BE_ALLOWED_TO_SCORE',
+      removedBlockers: previous.filter((v) => !unique.includes(v)), addedBlockers: unique.filter((v) => !previous.includes(v)) }
+  }
+  const s0 = stage(0, [...common, ...(current?.reasons ?? ['CURRENT_PREREQUISITES_NOT_RECORDED'])], [])
+  const s1 = stage(1, [...common, ...viewA.blockers, ...currentCompetitor], s0.blockers)
+  const s2 = stage(2, [...common, ...viewB.blockers, ...currentCompetitor], s1.blockers)
+  const s3 = stage(3, [...common, ...viewB.blockers, ...competitorBlockers], s2.blockers)
+  return { decision: { frameId: d.frameId, timestamp: d.timestamp, candidateCount: d.candidateCount },
+    authority: 'NONE', current, target: { observations: targets, pool, duplicates, relationships, viewA, viewB,
+      excludedUnassociatedHarvest: (acquisition?.observations ?? []).filter((a) => !a.reference).map((a) => ({
+        frameId: a.frameId, timestamp: a.timestamp, status: a.status, reasons: a.reasons,
+        causality: causal([a.timestamp, a.supportingEndpoints.left.timestamp, a.supportingEndpoints.right.timestamp])
+          ? 'PASS' : 'NOT AVAILABLE AT DECISION TIME' })) },
+    competitor: { obligations, inventory: 'UNKNOWN_COMPETITOR_INVENTORY', blockers: competitorBlockers },
+    stages: [s0, s1, s2, s3], proposedConservativeEligibility: s3.eligible }
+}

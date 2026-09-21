@@ -1,8 +1,8 @@
 "use client"
 
-import { useEffect, useRef, useState, type ChangeEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
 import BiomechanicsPanel from './BiomechanicsPanel'
-import { buildCompetitorProvenance, planTargetAcquisition, assessAcquiredTarget, relatedAcquiredTargets, type AcquiredTarget, buildReferenceLedger, type ReferenceObservation, trackIdentity, refineIdentity, identitySequenceAllowed, type IdentityEvidence, type IdentityObservation, type IdentityDiagnostic } from '@/lib/phase-detection'
+import { assessShadowEligibility, buildCompetitorProvenance, planTargetAcquisition, assessAcquiredTarget, relatedAcquiredTargets, type AcquiredTarget, buildReferenceLedger, type ReferenceObservation, trackIdentity, refineIdentity, identitySequenceAllowed, type IdentityEvidence, type IdentityObservation, type IdentityDiagnostic } from '@/lib/phase-detection'
 import type { NormalizedLandmark } from '@mediapipe/tasks-vision'
 import { planCoarseSampling, detectPhases, overridePhase, phaseGeometry, planPhaseRefinement, refinePhases, type RefinementResult, type PhaseResult, type PhaseCandidate } from '@/lib/phase-detection'
 import { buildCoachingBiomechanicsPayload, clearStoredVideoBiomechanics, COACHING_BIOMECHANICS_STORAGE_KEY, videoFingerprint } from '@/lib/coaching-biomechanics'
@@ -397,6 +397,17 @@ export default function PoseTestPage() {
   const detectionAudits = useRef(new WeakMap<PoseResult, DetectionAudit>())
   const [inspectedFrame, setInspectedFrame] = useState<string | null>(null)
   const autoCache = useRef(new Map<string, { image: HTMLImageElement; poses: PoseResult[]; poseIndex: number | null; score: number; identity?: IdentityEvidence; detection?: DetectionAudit; diagnostic?: IdentityDiagnostic }>())
+  const shadowAssessments = useMemo(() => {
+    if (!autoResult || !competitorProvenance || persistentAnchor?.timestamp == null) return []
+    return autoResult.candidates.flatMap((c) => {
+      const entry = autoCache.current.get(c.frameId)
+      if (!entry?.diagnostic?.code.startsWith('REACQUISITION_')) return []
+      return [assessShadowEligibility({ decision: { frameId: c.frameId, timestamp: c.timestamp,
+        direction: c.timestamp < persistentAnchor.timestamp! ? 'backward' : 'forward',
+        candidateCount: entry.poses.length, diagnostic: entry.diagnostic },
+        references: referenceLedger, acquisition, competitors: competitorProvenance })]
+    })
+  }, [autoResult, competitorProvenance, persistentAnchor, referenceLedger, acquisition])
 
   const imageRefs = useRef<Record<Phase, HTMLImageElement | null>>({} as any)
   const canvasRefs = useRef<Record<Phase, HTMLCanvasElement | null>>({} as any)
@@ -1643,6 +1654,19 @@ export default function PoseTestPage() {
                   {!autoResult.proposals.length && <p>Unresolved — keep manual selection.</p>}
                   <details className="text-xs border border-slate-600 p-2">
                     <summary>Reference provenance — shadow diagnostics only ({referenceLedger.length} observations)</summary>
+                    <details><summary>Shadow eligibility assessment — no authority ({shadowAssessments.length} checks)</summary>
+                      <p>Stage 0: recorded current gates. Stage 1: qualified target count only. Stage 2: target evidence groups. Stage 3: same-segment competitor coverage. No candidate scoring or confirmation is performed.</p>
+                      <p>Independence is unestablished. Historical competitor observations do not prove current player inventory. Future video evidence, including a bracket endpoint, is unavailable at an earlier decision.</p>
+                      <div className="overflow-x-auto"><table><thead><tr><th>Time / candidates</th><th>Current target / competitor</th><th>Target A / B</th><th>Stage 0 / 1 / 2 / 3</th></tr></thead><tbody>
+                        {shadowAssessments.map((a) => <tr key={a.decision.frameId} className="border-t border-slate-700">
+                          <td>{a.decision.timestamp.toFixed(3)}s / {a.decision.candidateCount}</td>
+                          <td>{a.current ? `${a.current.target.usable}/${a.current.target.required} target; ${a.current.competitor.usable}/${a.current.competitor.available} competitors usable` : 'Not recorded (no candidate)'}</td>
+                          <td>{a.target.viewA.satisfied ? 'Pass count only' : 'Blocked'} / independence unestablished</td>
+                          <td>{a.stages.map((s) => <details key={s.stage}><summary>Stage {s.stage}: {s.scoring}</summary><p>{s.blockers.join(', ') || 'Prerequisites only; no scoring executed'}</p><p>Removed: {s.removedBlockers.join(', ') || 'none'} · Added: {s.addedBlockers.join(', ') || 'none'}</p></details>)}
+                            <details><summary>Evidence groups, coverage and causality</summary><pre className="whitespace-pre-wrap">{JSON.stringify(a, null, 2)}</pre></details></td>
+                        </tr>)}
+                      </tbody></table></div>
+                    </details>
                     {competitorProvenance && <details><summary>Local competitor provenance — shadow only</summary>
                       <p>Local segments are not permanent identities. Coverage never changes reacquisition eligibility or proves that all current competitors are represented.</p>
                       <p>Observations: {competitorProvenance.observations.length} · segments: {competitorProvenance.segments.length} · unresolved identity: {competitorProvenance.unresolvedObligations.length} · qualified geometry: {competitorProvenance.observations.filter((o) => o.reference.qualification === 'qualified').length} · unusable geometry: {competitorProvenance.observations.filter((o) => o.reference.qualification === 'unusable').length}</p>
