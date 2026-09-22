@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
 import BiomechanicsPanel from './BiomechanicsPanel'
+import RawPoseResearch from './RawPoseResearch'
 import { assessShadowEligibility, buildCompetitorProvenance, planTargetAcquisition, assessAcquiredTarget, relatedAcquiredTargets, type AcquiredTarget, buildReferenceLedger, type ReferenceObservation, trackIdentity, refineIdentity, identitySequenceAllowed, type IdentityEvidence, type IdentityObservation, type IdentityDiagnostic } from '@/lib/phase-detection'
 import type { NormalizedLandmark } from '@mediapipe/tasks-vision'
 import { planCoarseSampling, detectPhases, overridePhase, phaseGeometry, planPhaseRefinement, refinePhases, type RefinementResult, type PhaseResult, type PhaseCandidate } from '@/lib/phase-detection'
@@ -31,6 +32,63 @@ interface PoseAnalysis {
   averageConfidence: number
   averageVisibility: number
   processingTimeMs: number
+}
+
+// Read-only development audit of cached image landmarks. Never used by identity decisions.
+function CompetitorGeometryAudit({ pose, image, width, height }: { pose: PoseResult; image: string; width: number; height: number }) {
+  const joints = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
+  const limbs = [[11, 13], [13, 15], [12, 14], [14, 16], [23, 25], [25, 27], [24, 26], [26, 28]]
+  const names = ['left upper arm', 'left forearm', 'right upper arm', 'right forearm', 'left thigh', 'left shank', 'right thigh', 'right shank']
+  const aspect = width / height
+  const point = (i: number) => pose.landmarks[i]
+  const qualified = (i: number) => !!point(i) && Number.isFinite(point(i).x) && Number.isFinite(point(i).y) && (point(i).visibility ?? 0) >= 0.75
+  const torsoIds = [11, 12, 23, 24]
+  const torsoLength = torsoIds.every((i) => point(i)) ? Math.hypot(
+    (point(11).x + point(12).x - point(23).x - point(24).x) * aspect / 2,
+    (point(11).y + point(12).y - point(23).y - point(24).y) / 2) : NaN
+  const features = limbs.map(([a, b], index) => {
+    const length = point(a) && point(b) ? Math.hypot((point(b).x - point(a).x) * aspect, point(b).y - point(a).y) : NaN
+    const dependencies = [...new Set([...torsoIds, a, b])]
+    const blockers = dependencies.filter((i) => !qualified(i)).map((i) => `LANDMARK_${i}_QUALITY`)
+    if (!Number.isFinite(torsoLength) || torsoLength < 0.02) blockers.push('TORSO_QUALITY')
+    if (!Number.isFinite(length) || length < 0.01) blockers.push('LIMB_LENGTH')
+    return { name: names[index], endpoints: [a, b], dependencies, length, computable: blockers.length === 0, blockers }
+  })
+  const audit = { authority: 'NONE', poseIndex: pose.poseIndex, source: pose.detectionSource, width, height, aspect,
+    thresholds: { visibility: 0.75, torsoLength: 0.02, limbLength: 0.01 }, torsoLength,
+    landmarks: joints.map((i) => ({ index: i, x: point(i)?.x, y: point(i)?.y, visibility: point(i)?.visibility, qualityPass: qualified(i) })),
+    totalFeatures: 8, scalarComponents: 16, computableFeatures: features.filter((f) => f.computable).length, features }
+  return <details className="border border-slate-700 p-2"><summary>Geometry audit pose #{pose.poseIndex} — {pose.detectionSource}</summary>
+    <p>Read-only cached landmarks. Red: below current quality requirement; cyan: passes. Labels are joint indices. Computability is not sufficient identity evidence and never authorizes scoring.</p>
+    <svg viewBox={`0 0 ${width} ${height}`} className="w-full max-w-3xl" role="img" aria-label={`Geometry overlay pose ${pose.poseIndex}`}>
+      <image href={image} width={width} height={height} />
+      {[...limbs, [11, 12], [23, 24], [11, 23], [12, 24]].map(([a, b]) => point(a) && point(b) &&
+        <line key={`${a}-${b}`} x1={point(a).x * width} y1={point(a).y * height} x2={point(b).x * width} y2={point(b).y * height} stroke={qualified(a) && qualified(b) ? '#22d3ee' : '#ff4757'} strokeWidth={2} />)}
+      {joints.map((i) => point(i) && <g key={i}><circle cx={point(i).x * width} cy={point(i).y * height} r={3} fill={qualified(i) ? '#22d3ee' : '#ff4757'} />
+        <text x={point(i).x * width + 4} y={point(i).y * height - 4} fontSize={12} fill="white" stroke="black" strokeWidth={0.4}>{i}</text></g>)}
+    </svg>
+    <pre className="text-xs whitespace-pre-wrap">{JSON.stringify(audit, null, 2)}</pre>
+  </details>
+}
+
+type RawPoseTrace = { source: string; passPose: number; input: string; width: number; height: number; sx: number; fullWidth: number; landmarks: NormalizedLandmark[] }
+type PipelineTrace = { sourceImage: string; records: Array<{ poseIndex: number; raw: RawPoseTrace; final: PoseResult; retained: boolean; suppressedBy: number | null; overlaps: Array<{ poseIndex: number; iou: number }> }> }
+// Independent snapshots for origin research only; never consumed by detection/identity.
+function PosePipelineAudit({ trace, poseIndex, image, frameId, timestamp }: { trace?: PipelineTrace; poseIndex: number; image: string; frameId: string; timestamp: number }) {
+  const record = trace?.records.find((r) => r.poseIndex === poseIndex)
+  if (!record || !trace) return null
+  const r = record.raw
+  const box = (points: NormalizedLandmark[], w: number, h: number) => ({ left: Math.min(...points.map((p) => p.x)) * w, top: Math.min(...points.map((p) => p.y)) * h, width: (Math.max(...points.map((p) => p.x)) - Math.min(...points.map((p) => p.x))) * w, height: (Math.max(...points.map((p) => p.y)) - Math.min(...points.map((p) => p.y))) * h })
+  const errors = r.landmarks.map((p, i) => ({ index: i, x: Math.abs((p.x * r.width + r.sx) / r.fullWidth - record.final.landmarks[i].x), y: Math.abs(p.y - record.final.landmarks[i].y) }))
+  return <details><summary>Pipeline origin pose #{poseIndex}</summary>
+    <p>Raw detector input and copied output, before remapping or association. Read-only; no authority.</p>
+    <svg viewBox={`0 0 ${r.width} ${r.height}`} className="w-full max-w-3xl" role="img" aria-label={`Raw detector overlay pose ${poseIndex}`}>
+      <image href={r.input} width={r.width} height={r.height} />
+      {[[11, 12], [11, 23], [12, 24], [23, 24], [11, 13], [13, 15], [12, 14], [14, 16], [23, 25], [25, 27], [24, 26], [26, 28]].map(([a,b]) => <line key={`${a}-${b}`} x1={r.landmarks[a].x*r.width} y1={r.landmarks[a].y*r.height} x2={r.landmarks[b].x*r.width} y2={r.landmarks[b].y*r.height} stroke="#ff4757" strokeWidth={2} />)}
+      {[11,12,13,14,15,16,23,24,25,26,27,28].map((i) => <text key={i} x={r.landmarks[i].x*r.width} y={r.landmarks[i].y*r.height} fill="white" stroke="black" strokeWidth={0.4} fontSize={12}>{i}</text>)}
+    </svg>
+    <pre className="text-xs whitespace-pre-wrap">{JSON.stringify({ authority: 'NONE', frameId, timestamp, sameSourceImage: trace.sourceImage === image, source: r.source, passPose: r.passPose, inputWidth: r.width, inputHeight: r.height, cropX: r.sx, fullWidth: r.fullWidth, rawLandmarks: r.landmarks, rawBox: box(r.landmarks,r.width,r.height), finalLandmarks: record.final.landmarks, finalBox: record.final.bbox, mappingMaxError: Math.max(...errors.flatMap((e) => [e.x,e.y])), retained: record.retained, suppressedBy: record.suppressedBy, allPasses: trace.records.map((p) => ({ poseIndex: p.poseIndex, source: p.raw.source, passPose: p.raw.passPose, bbox: p.final.bbox, retained: p.retained, suppressedBy: p.suppressedBy, overlaps: p.overlaps })) }, null, 2)}</pre>
+  </details>
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -393,7 +451,7 @@ export default function PoseTestPage() {
   const [autoBusy, setAutoBusy] = useState(false)
   const [paddleHand, setPaddleHand] = useState<'left' | 'right'>('right')
   const [selectionOrigin, setSelectionOrigin] = useState<Record<Phase, string>>({ ready: 'MANUAL', contact: 'MANUAL', recovery: 'MANUAL' })
-  type DetectionAudit = { raw: number; sources: Record<string, number>; candidates: PoseResult[] }
+  type DetectionAudit = { raw: number; sources: Record<string, number>; candidates: PoseResult[]; trace?: PipelineTrace }
   const detectionAudits = useRef(new WeakMap<PoseResult, DetectionAudit>())
   const [inspectedFrame, setInspectedFrame] = useState<string | null>(null)
   const autoCache = useRef(new Map<string, { image: HTMLImageElement; poses: PoseResult[]; poseIndex: number | null; score: number; identity?: IdentityEvidence; detection?: DetectionAudit; diagnostic?: IdentityDiagnostic }>())
@@ -710,7 +768,7 @@ export default function PoseTestPage() {
       for (let i = 0; i < fullLandmarks.length; i++) {
         const lms = fullLandmarks[i]
         const world = fullWorld[i] ?? null
-        posesOut.push({ landmarks: lms, worldLandmarks: world, detectionSource: 'FULL_FRAME' })
+        posesOut.push({ landmarks: lms, worldLandmarks: world, detectionSource: 'FULL_FRAME', rawTrace: { source: 'FULL_FRAME', passPose: i + 1, input: image.src, width: fullSize.width, height: fullSize.height, sx: 0, fullWidth: fullSize.width, landmarks: lms.map((p: NormalizedLandmark) => ({ ...p })) } })
       }
     }
 
@@ -744,7 +802,7 @@ export default function PoseTestPage() {
           // map landmark x,y back to full-frame normalized coords
           const lset = lm[i].map((pt: any) => ({ x: (pt.x * sw + sx) / w, y: (pt.y * h) / h, visibility: pt.visibility }))
           const world = wl[i] ?? null
-          posesOut.push({ landmarks: lset, worldLandmarks: world, detectionSource: label })
+          posesOut.push({ landmarks: lset, worldLandmarks: world, detectionSource: label, rawTrace: { source: label, passPose: i + 1, input: img.src, width: sw, height: h, sx, fullWidth: w, landmarks: lm[i].map((p: NormalizedLandmark) => ({ ...p })) } })
         }
       }
 
@@ -789,7 +847,8 @@ export default function PoseTestPage() {
       if (!dup) deduped.push(p)
     }
 
-    const audit: DetectionAudit = { raw: posesOut.length, sources, candidates: deduped }
+    const trace: PipelineTrace = { sourceImage: image.src, records: poseResults.map((p) => ({ poseIndex: p.poseIndex, raw: posesOut[p.poseIndex - 1].rawTrace, final: { ...p, bbox: { ...p.bbox }, landmarks: p.landmarks.map((l) => ({ ...l })) }, retained: deduped.includes(p), suppressedBy: deduped.includes(p) ? null : deduped.find((k) => iou(p.bbox, k.bbox) > 0.5)?.poseIndex ?? null, overlaps: poseResults.filter((q) => q !== p).map((q) => ({ poseIndex: q.poseIndex, iou: iou(p.bbox, q.bbox) })) })) }
+    const audit: DetectionAudit = { raw: posesOut.length, sources, candidates: deduped, trace }
     for (const p of deduped) detectionAudits.current.set(p, audit)
     observe?.(audit)
     return deduped
@@ -1593,6 +1652,12 @@ export default function PoseTestPage() {
                   </div>
                 </div>
 
+                <RawPoseResearch video={videoFile?.name ?? ''} videoUrl={videoUrl} fingerprint={videoFile ? videoFingerprint(videoFile) : null} frames={frames} busy={autoBusy || extracting || Object.values(loading).some(Boolean)} detect={async (image) => {
+                  let trace: PipelineTrace | undefined
+                  await detectMultiPass(image, { width: image.naturalWidth, height: image.naturalHeight }, audit => { trace = audit.trace })
+                  if (!trace) throw new Error('Detector trace unavailable')
+                  return trace
+                }} />
                 {frames && frames.length > 0 ? (
                   <div className="mt-4">
                     <div className="mb-2 text-sm text-slate-300">Candidate frames ({frames.length}) — select a phase then click a thumbnail to assign</div>
@@ -1757,6 +1822,8 @@ export default function PoseTestPage() {
                           {candidates.map((p) => <div key={p.poseIndex} className={`absolute border-2 pointer-events-none ${entry.identity?.accepted && entry.poseIndex === p.poseIndex ? 'border-emerald-400' : 'border-amber-400'}`} style={{ left: `${100 * p.bbox.left / entry.image.naturalWidth}%`, top: `${100 * p.bbox.top / entry.image.naturalHeight}%`, width: `${100 * p.bbox.width / entry.image.naturalWidth}%`, height: `${100 * p.bbox.height / entry.image.naturalHeight}%` }}><span className="bg-slate-950 text-xs">#{p.poseIndex} · {label(p)}</span></div>)}
                         </div>
                         {candidates.length === 0 && <p>No detected candidate boxes.</p>}
+                        {candidates.filter((p) => referenceLedger.some((r) => r.role === 'competitor' && r.frameId === frame.frameId && r.candidateId === `${frame.frameId}:${p.poseIndex}`)).map((p) =>
+                          <div key={p.poseIndex}><CompetitorGeometryAudit pose={p} image={frame.imageDataUrl} width={entry.image.naturalWidth} height={entry.image.naturalHeight} /><PosePipelineAudit trace={entry.detection?.trace} poseIndex={p.poseIndex} image={frame.imageDataUrl} frameId={frame.frameId} timestamp={frame.timestampSeconds} /></div>)}
                         {candidates.map((p) => {
                           const d = entry.diagnostic?.candidates.find((c) => c.poseIndex === p.poseIndex)
                           return <p className="text-xs" key={p.poseIndex}>Pose #{p.poseIndex} · {p.detectionSource} · {label(p)}{d?.targetDistance != null && ` · target pose distance ${d.targetDistance.toFixed(3)} · competitor distance ${d.competitorDistance?.toFixed(3)}`}</p>
