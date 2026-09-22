@@ -2,8 +2,9 @@ const {test}=require('node:test')
 const assert=require('node:assert/strict')
 const fs=require('node:fs'),path=require('node:path'),Module=require('node:module'),ts=require('typescript')
 const {execFileSync}=require('node:child_process')
-function load(file,mocks={}){const name=path.resolve(__dirname,'..',file),m=new Module(name,module);m.filename=name;m.paths=module.paths;m.require=id=>id in mocks?mocks[id]:require(id);m._compile(ts.transpileModule(fs.readFileSync(name,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020,jsx:ts.JsxEmit.ReactJSX}}).outputText,name);return m.exports}
+function load(file,mocks={}){const name=path.resolve(__dirname,'..',file),m=new Module(name,module);m.filename=name;m.paths=module.paths;m.require=id=>id in mocks?mocks[id]:require(id);m._compile(ts.transpileModule(fs.readFileSync(name,'utf8'),{fileName:name,compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020,jsx:ts.JsxEmit.ReactJSX}}).outputText,name);return m.exports}
 const helpers=load('src/lib/pose-research.ts')
+const captureHelpers=load('src/lib/research-capture.ts')
 const {measurePose,researchId,labelResearch}=helpers
 const pose=Array.from({length:33},(_,i)=>({x:.2+(i%3)*.08,y:.1+i*.02,visibility:.9}))
 test('fixed measurements deterministic and do not mutate input',()=>{const before=JSON.stringify(pose);assert.deepEqual(measurePose(pose,576,1024),measurePose(pose,576,1024));assert.equal(JSON.stringify(pose),before)})
@@ -14,9 +15,9 @@ test('labels update only the requested research row immutably',()=>{const rows=[
 
 test('real component frame selection, detection and labeling have no product-state outputs',async()=>{
   const slots=[];let index=0
-  const react={useState:init=>{const i=index++;if(!(i in slots))slots[i]=init;return[slots[i],v=>{slots[i]=typeof v==='function'?v(slots[i]):v}]},useRef:init=>{const i=index++;if(!(i in slots))slots[i]={current:init};return slots[i]}}
+  const react={useEffect:()=>{},useState:init=>{const i=index++;if(!(i in slots))slots[i]=init;return[slots[i],v=>{slots[i]=typeof v==='function'?v(slots[i]):v}]},useRef:init=>{const i=index++;if(!(i in slots))slots[i]={current:init};return slots[i]}}
   const jsx=(type,props)=>({type,props})
-  const Component=load('src/app/pose-test/RawPoseResearch.tsx',{'react':react,'react/jsx-runtime':{jsx,jsxs:jsx},'@/lib/pose-research':helpers}).default
+  const Component=load('src/app/pose-test/RawPoseResearch.tsx',{'react':react,'react/jsx-runtime':{jsx,jsxs:jsx},'@/lib/pose-research':helpers,'@/lib/research-capture':{...captureHelpers,captureResearchFrame:async(url,time,id)=>Object.freeze({frameId:id,timestampSeconds:time,imageDataUrl:'data:frame',imageFingerprint:captureHelpers.imageFingerprint('data:frame'),timing:{requestedTime:time,actualTime:time,integrity:'VERIFIED'}})}}).default
   const product={tracking:['anchor'],ledger:['reference'],reacquisition:[],phases:{ready:'f1'},biomechanics:{},coaching:{}}
   const before=JSON.stringify(product)
   const frame=Object.freeze({frameId:'f2',timestampSeconds:2,imageDataUrl:'data:frame'})
