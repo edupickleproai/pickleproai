@@ -1,6 +1,7 @@
 "use client"
 
 import { useEffect, useRef, useState } from 'react'
+import ResearchVideoSource, { type ResearchVideo } from './ResearchVideoSource'
 import { assessPoseCoherence } from '@/lib/pose-coherence'
 import { captureResearchFrame, assertFrozenInput, imageFingerprint, ResearchTransactions, researchExport, downloadResearchJson, type FrozenResearchFrame, type CaptureTiming, runResearchBatch, type ResearchBatchResult, type CaptureAttempt, ResearchCaptureError } from '@/lib/research-capture'
 import { labelResearch, measurePose, researchId, RESEARCH_JOINTS, RESEARCH_LIMBS, type ResearchLabel, type ResearchPoint } from '@/lib/pose-research'
@@ -21,7 +22,12 @@ function Overlay({image,points,width,height,name}:{image:string;points:ResearchP
 
 // This component owns all research state. Its only parent callback returns detection snapshots.
 // No product-state setters, reference enrollment, storage, or API clients are available here.
-export default function RawPoseResearch({video,videoUrl,fingerprint,frames,busy,detect}:{video:string;videoUrl:string|null;fingerprint:string|null;frames:Frame[];busy:boolean;detect:(image:HTMLImageElement)=>Promise<Trace>}) {
+export default function RawPoseResearch({video:uploadedVideo,videoUrl:uploadedUrl,fingerprint:uploadedFingerprint,frames:uploadedFrames,busy,detect}:{video:string;videoUrl:string|null;fingerprint:string|null;frames:Frame[];busy:boolean;detect:(image:HTMLImageElement)=>Promise<Trace>}) {
+  const [localSource,setLocalSource]=useState<{video:ResearchVideo;ready:boolean}|null>(null)
+  const video=localSource?.video.filename??uploadedVideo
+  const videoUrl=localSource?(localSource.ready?localSource.video.url:null):uploadedUrl
+  const fingerprint=localSource?.video.id??uploadedFingerprint
+  const frames=localSource?[]:uploadedFrames
   const [selectedFrame,setSelectedFrame]=useState('')
   const [timestamp,setTimestamp]=useState('0')
   const [captures,setCaptures]=useState<Capture[]>([])
@@ -42,6 +48,12 @@ export default function RawPoseResearch({video,videoUrl,fingerprint,frames,busy,
     controller.current?.abort('SOURCE_CHANGE');transactions.current.cancel();source.current={fingerprint,videoUrl}
   }
   useEffect(()=>()=>{diagnosticSession.current++;controller.current?.abort();transactions.current.cancel()},[])
+  const changeResearchSource=(next:ResearchVideo|null,ready:boolean)=>{
+    controller.current?.abort('SOURCE_CHANGE');transactions.current.cancel()
+    setLocalSource(next?{video:next,ready}:null)
+    setSelectedFrame('');setTimestamp('0');setBatchTimes('');setActive(null);setExportText('');setMessage('')
+    // Completed records retain their original source; in-flight work keeps its lock until it settles.
+  }
   const run=async(times:number[])=>{
     if(busy||processing.current||!videoUrl||!fingerprint)return
     if(captures.length+times.length>100){setMessage('Session limit: 100 captures. Clear research session before collecting more.');return}
@@ -94,6 +106,7 @@ export default function RawPoseResearch({video,videoUrl,fingerprint,frames,busy,
 
   return <section className="my-6 border border-cyan-800 p-4 space-y-3" aria-label="Raw pose research">
     <h2>Raw Pose Research — development only</h2>
+    {process.env.NODE_ENV==='development'&&<ResearchVideoSource onChange={changeResearchSource}/>}
     <p>Zero authority. Inspect raw alignment first; measurements are collapsed. Labels/notes stay in memory and never become identity or coaching evidence. Pose indices are frame-local.</p>
     <p>Capture requires a presented-frame timestamp and two following frames with consistent cadence. Unsupported browsers, irregular or missed presentations, and clips too near the end remain UNVERIFIED and create no record. Repeated captures keep separate IDs and labels.</p>
     <label>Research frame (recaptured independently) <select disabled={running} aria-label="Research frame" value={selectedFrame} onChange={e=>setSelectedFrame(e.target.value)} className="bg-slate-800"><option value="">Extract research timestamp</option>{frames.map(f=><option key={f.frameId} value={f.frameId}>{f.timestampSeconds.toFixed(3)}s · {f.frameId}</option>)}</select></label>

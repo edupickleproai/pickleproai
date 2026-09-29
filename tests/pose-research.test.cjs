@@ -19,7 +19,7 @@ test('real component frame selection, detection and labeling have no product-sta
   const jsx=(type,props)=>({type,props})
   let forcedShadowStatus='NO_OBVIOUS_ANOMALY'
   const shadow=load('src/lib/pose-coherence.ts')
-  const Component=load('src/app/pose-test/RawPoseResearch.tsx',{'react':react,'react/jsx-runtime':{jsx,jsxs:jsx},'@/lib/pose-research':helpers,'@/lib/pose-coherence':{assessPoseCoherence:m=>({...shadow.assessPoseCoherence(m),status:forcedShadowStatus})},'@/lib/research-capture':{...captureHelpers,captureResearchFrame:async(url,time,id)=>Object.freeze({frameId:id,timestampSeconds:time,imageDataUrl:'data:frame',imageFingerprint:captureHelpers.imageFingerprint('data:frame'),timing:{requestedTime:time,actualTime:time,integrity:'VERIFIED'}})}}).default
+  const Component=load('src/app/pose-test/RawPoseResearch.tsx',{'./ResearchVideoSource':{__esModule:true,default:()=>null},'react':react,'react/jsx-runtime':{jsx,jsxs:jsx},'@/lib/pose-research':helpers,'@/lib/pose-coherence':{assessPoseCoherence:m=>({...shadow.assessPoseCoherence(m),status:forcedShadowStatus})},'@/lib/research-capture':{...captureHelpers,captureResearchFrame:async(url,time,id)=>Object.freeze({frameId:id,timestampSeconds:time,imageDataUrl:'data:frame',imageFingerprint:captureHelpers.imageFingerprint('data:frame'),timing:{requestedTime:time,actualTime:time,integrity:'VERIFIED'}})}}).default
   const product={tracking:['anchor'],ledger:['reference'],reacquisition:[],phases:{ready:'f1'},biomechanics:{},coaching:{}}
   const before=JSON.stringify(product)
   const frame=Object.freeze({frameId:'f2',timestampSeconds:2,imageDataUrl:'data:frame'})
