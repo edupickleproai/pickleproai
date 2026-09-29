@@ -13,13 +13,15 @@ test('invalid and degenerate geometry abstains numerically without classifying',
 test('pose indices are frame/video/source local metadata',()=>{assert.notEqual(researchId('v','f1','FULL_FRAME',1,'raw'),researchId('v','f2','FULL_FRAME',1,'raw'));assert.notEqual(researchId('v','f1','FULL_FRAME',1,'raw'),researchId('v','f1','LEFT_CROP',1,'raw'))})
 test('labels update only the requested research row immutably',()=>{const rows=[{id:'a',label:'UNLABELED',note:''},{id:'b',label:'UNLABELED',note:''}];const next=labelResearch(rows,'a','COHERENT','visual review');assert.equal(rows[0].label,'UNLABELED');assert.equal(next[1],rows[1]);assert.equal(next[0].label,'COHERENT')})
 
-test('real component frame selection, detection and labeling have no product-state outputs',async()=>{
+test('real component frame selection, detection and labeling have no product-state outputs',async(t)=>{
+  const oldMode=process.env.NODE_ENV;process.env.NODE_ENV='development'
+  t.after(()=>{if(oldMode===undefined)delete process.env.NODE_ENV;else process.env.NODE_ENV=oldMode})
   const slots=[];let index=0
   const react={useEffect:()=>{},useState:init=>{const i=index++;if(!(i in slots))slots[i]=init;return[slots[i],v=>{slots[i]=typeof v==='function'?v(slots[i]):v}]},useRef:init=>{const i=index++;if(!(i in slots))slots[i]={current:init};return slots[i]}}
   const jsx=(type,props)=>({type,props})
   let forcedShadowStatus='NO_OBVIOUS_ANOMALY'
   const shadow=load('src/lib/pose-coherence.ts')
-  const Component=load('src/app/pose-test/RawPoseResearch.tsx',{'./ResearchVideoSource':{__esModule:true,default:()=>null},'react':react,'react/jsx-runtime':{jsx,jsxs:jsx},'@/lib/pose-research':helpers,'@/lib/pose-coherence':{assessPoseCoherence:m=>({...shadow.assessPoseCoherence(m),status:forcedShadowStatus})},'@/lib/research-capture':{...captureHelpers,captureResearchFrame:async(url,time,id)=>Object.freeze({frameId:id,timestampSeconds:time,imageDataUrl:'data:frame',imageFingerprint:captureHelpers.imageFingerprint('data:frame'),timing:{requestedTime:time,actualTime:time,integrity:'VERIFIED'}})}}).default
+  const Component=load('src/app/pose-test/RawPoseResearch.tsx',{'./ResearchVideoSource':{__esModule:true,default:()=>null},'./RawPoseReview':{__esModule:true,default:()=>null},'@/lib/research-review':load('src/lib/research-review.ts'),'react':react,'react/jsx-runtime':{jsx,jsxs:jsx},'@/lib/pose-research':helpers,'@/lib/pose-coherence':{assessPoseCoherence:m=>({...shadow.assessPoseCoherence(m),status:forcedShadowStatus})},'@/lib/research-capture':{...captureHelpers,captureResearchFrame:async(url,time,id)=>Object.freeze({frameId:id,timestampSeconds:time,imageDataUrl:'data:frame',imageFingerprint:captureHelpers.imageFingerprint('data:frame'),timing:{requestedTime:time,actualTime:time,integrity:'VERIFIED'}})}}).default
   const product={tracking:['anchor'],ledger:['reference'],reacquisition:[],phases:{ready:'f1'},biomechanics:{},coaching:{}}
   const before=JSON.stringify(product)
   const frame=Object.freeze({frameId:'f2',timestampSeconds:2,imageDataUrl:'data:frame'})
@@ -33,18 +35,10 @@ test('real component frame selection, detection and labeling have no product-sta
   const OldImage=global.Image;global.Image=class{set src(v){this._src=v;this.onload()}get src(){return this._src}}
   try{await find(tree,n=>n.type==='button'&&n.props.children==='Inspect research frame').props.onClick()}finally{global.Image=OldImage}
   tree=render();assert.equal(called,1)
-  const stateBeforeShadow=JSON.stringify(slots)
-  forcedShadowStatus='STRONGLY_SUSPICIOUS';tree=render()
-  assert.ok(JSON.stringify(tree).includes('STRONGLY_SUSPICIOUS'))
-  assert.equal(JSON.stringify(slots),stateBeforeShadow)
-  assert.equal(called,1)
-  const shadowPanel=find(tree,n=>n.type==='details'&&JSON.stringify(n).includes('Shadow pose assessment'))
-  assert.equal(shadowPanel.props.open,undefined)
-  assert.ok(JSON.stringify(tree).includes('RESEARCH ONLY — NO PRODUCT AUTHORITY'))
-  find(tree,n=>n.props?.['aria-label']==='Research label').props.onChange({target:{value:'COHERENT'}})
-  tree=render();const rendered=JSON.stringify(tree)
-  assert.ok(rendered.includes('COHERENT'));assert.ok(rendered.includes('LEFT_CROP'));assert.ok(rendered.includes('pass 2')||rendered.includes('pass '))
-  assert.equal(JSON.stringify(product),before)
+  const workspace=find(tree,n=>Array.isArray(n.props?.records));assert.equal(workspace.props.records.length,1)
+  assert.equal(find(tree,n=>n.props?.['aria-label']==='Shadow pose assessment'),undefined)
+  workspace.props.onAction(workspace.props.records[0].id,{type:'commit',label:'COHERENT',note:'visual review',at:'test'})
+  tree=render();assert.equal(JSON.stringify(product),before)
   // State consists only of research captures/rows and view selection. Linked raw/final rows share provenance.
   const rows=slots.find(s=>Array.isArray(s)&&s[0]?.stage)
   assert.equal(rows.length,2);assert.equal(rows[0].captureId,rows[1].captureId);assert.equal(rows[0].poseIndex,7);assert.equal(rows[1].passPose,2)

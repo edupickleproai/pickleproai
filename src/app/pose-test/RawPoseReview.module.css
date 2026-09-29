@@ -1,0 +1,19 @@
+.workspace { position: fixed; inset: 0; z-index: 10000; overflow-y: auto; overscroll-behavior: contain; background: #07101e; color: #f1f5f9; padding: 8px; font: 15px/1.45 system-ui, sans-serif; color-scheme: dark; }
+.header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 6px; padding: 8px 0; }
+.workspace button, .workspace select { min-height: 42px; border: 1px solid #64748b; border-radius: 6px; padding: 8px 10px; background: #17283c; color: white; }
+.workspace button:disabled { opacity: .45; }
+.workspace button:focus-visible, .workspace select:focus-visible, .workspace textarea:focus-visible { outline: 3px solid #22d3ee; outline-offset: 2px; }
+.record { display: block; width: 100%; max-width: 1100px; margin: auto; }
+.reference { margin: 4px 0; overflow-wrap: anywhere; }
+.image { display: block; width: 100%; height: min(60dvh, 650px); min-height: 300px; background: #020617; touch-action: none; cursor: grab; }
+.hint { font-size: 13px; color: #b8c9db; }
+.metadata { overflow-wrap: anywhere; font-size: 13px; }
+.metadata dt { color: #a5c8e8; }
+.metadata dd { margin: 0 0 8px; }
+.labels { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; border: 1px solid #365069; padding: 10px; margin: 12px 0; min-width: 0; }
+.labels label { display: grid; gap: 4px; }
+.labels textarea { width: 100%; min-height: 65px; background: #101e30; border: 1px solid #64748b; padding: 6px; }
+.workspace pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+.workspace summary { cursor: pointer; padding: 8px 0; }
+@media (max-width: 550px) { .workspace { padding: 6px; } .header { font-size: 13px; } .controls { justify-content: flex-start; } .image { min-height: 320px; } }

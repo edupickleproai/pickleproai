@@ -2,15 +2,17 @@
 
 import { useEffect, useRef, useState } from 'react'
 import ResearchVideoSource, { type ResearchVideo } from './ResearchVideoSource'
+import RawPoseReview from './RawPoseReview'
+import { reviewAction, withReviewHistory, type ReviewHistory } from '@/lib/research-review'
 import { assessPoseCoherence } from '@/lib/pose-coherence'
 import { captureResearchFrame, assertFrozenInput, imageFingerprint, ResearchTransactions, researchExport, downloadResearchJson, type FrozenResearchFrame, type CaptureTiming, runResearchBatch, type ResearchBatchResult, type CaptureAttempt, ResearchCaptureError } from '@/lib/research-capture'
-import { labelResearch, measurePose, researchId, RESEARCH_JOINTS, RESEARCH_LIMBS, type ResearchLabel, type ResearchPoint } from '@/lib/pose-research'
+import { measurePose, researchId, RESEARCH_JOINTS, RESEARCH_LIMBS, type ResearchLabel, type ResearchPoint } from '@/lib/pose-research'
 
 type Frame = { frameId: string; timestampSeconds: number; imageDataUrl: string }
 type Pose = { poseIndex: number; landmarks: ResearchPoint[]; bbox: {left:number;top:number;width:number;height:number} }
 type Trace = { sourceImage: string; records: Array<{poseIndex:number; raw:{source:string;passPose:number;input:string;width:number;height:number;sx:number;fullWidth:number;landmarks:ResearchPoint[]}; final:Pose;retained:boolean;suppressedBy:number|null;overlaps:Array<{poseIndex:number;iou:number}>}> }
 type Capture = { id:string;video:string;fingerprint:string;frame:FrozenResearchFrame;trace:Trace }
-type Row = {id:string;captureId:string;video:string;fingerprint:string;timestamp:number;frameId:string;source:string;passPose:number;poseIndex:number;stage:'raw'|'final';requestedTime:number;actualTime:number;frameFingerprint:string;detectorInputFingerprint:string;sourceImageFingerprint:string;timing:CaptureTiming;label:ResearchLabel;note:string;measurements:ReturnType<typeof measurePose>}
+type Row = {id:string;captureId:string;video:string;fingerprint:string;timestamp:number;frameId:string;source:string;passPose:number;poseIndex:number;stage:'raw'|'final';requestedTime:number;actualTime:number;frameFingerprint:string;detectorInputFingerprint:string;sourceImageFingerprint:string;timing:CaptureTiming;label:ResearchLabel;note:string;review?:ReviewHistory;measurements:ReturnType<typeof measurePose>}
 
 function Overlay({image,points,width,height,name}:{image:string;points:ResearchPoint[];width:number;height:number;name:string}) {
   return <svg role="img" aria-label={name} viewBox={`0 0 ${width} ${height}`} className="w-full max-w-3xl max-h-[700px]">
@@ -102,12 +104,17 @@ export default function RawPoseResearch({video:uploadedVideo,videoUrl:uploadedUr
     await run(values)
   }
   const row=rows.find(r=>r.id===active),capture=captures.find(c=>c.id===row?.captureId),record=capture?.trace.records.find(r=>r.poseIndex===row?.poseIndex)
-  const exportRows=()=>{const json=researchExport(rows);setExportText(json);downloadResearchJson(json)}
+  const exportRows=()=>{const json=withReviewHistory(researchExport(rows),rows);setExportText(json);downloadResearchJson(json)}
 
   return <section className="my-6 border border-cyan-800 p-4 space-y-3" aria-label="Raw pose research">
     <h2>Raw Pose Research — development only</h2>
     {process.env.NODE_ENV==='development'&&<ResearchVideoSource onChange={changeResearchSource}/>}
-    <p>Zero authority. Inspect raw alignment first; measurements are collapsed. Labels/notes stay in memory and never become identity or coaching evidence. Pose indices are frame-local.</p>
+    {process.env.NODE_ENV==='development'&&<RawPoseReview
+      records={rows.filter(r=>r.stage==='raw').flatMap(r=>{const c=captures.find(item=>item.id===r.captureId),raw=c?.trace.records.find(item=>item.poseIndex===r.poseIndex)?.raw;return c&&raw?[{...r,stage:'raw' as const,image:c.frame.imageDataUrl,rawImage:raw.input,width:raw.fullWidth,height:raw.height,rawWidth:raw.width,offsetX:raw.sx,points:raw.landmarks}]:[]})}
+      selectedId={active} onSelect={setActive}
+      onAction={(id,action)=>{setRows(old=>old.map(r=>r.id===id?reviewAction(r,action):r));setExportText('')}}
+      assess={assessPoseCoherence}/>}
+    <p>Zero authority. Commit a visual label in the blinded workspace before revealing Shadow or measurements. Labels/notes stay in memory and never become identity or coaching evidence. Pose indices are frame-local.</p>
     <p>Capture requires a presented-frame timestamp and two following frames with consistent cadence. Unsupported browsers, irregular or missed presentations, and clips too near the end remain UNVERIFIED and create no record. Repeated captures keep separate IDs and labels.</p>
     <label>Research frame (recaptured independently) <select disabled={running} aria-label="Research frame" value={selectedFrame} onChange={e=>setSelectedFrame(e.target.value)} className="bg-slate-800"><option value="">Extract research timestamp</option>{frames.map(f=><option key={f.frameId} value={f.frameId}>{f.timestampSeconds.toFixed(3)}s · {f.frameId}</option>)}</select></label>
     <label>Research timestamp <input disabled={running} aria-label="Research timestamp" type="number" min="0" step="0.001" value={timestamp} onChange={e=>{setTimestamp(e.target.value);setSelectedFrame('')}} className="bg-slate-800"/></label>
@@ -131,15 +138,6 @@ export default function RawPoseResearch({video:uploadedVideo,videoUrl:uploadedUr
       <p>Raw source: {record.raw.source}/{record.raw.passPose} → frame-local #{record.poseIndex}. {record.retained?'Retained by existing dedup':`Suppressed by frame-local #${record.suppressedBy}`}</p>
       <details><summary>Capture integrity</summary><pre aria-label="Capture diagnostics">{JSON.stringify({frameId:row.frameId,frameFingerprint:row.frameFingerprint,detectorInputFingerprint:row.detectorInputFingerprint,sourceImageFingerprint:row.sourceImageFingerprint,width:capture.frame.width,height:capture.frame.height,...row.timing},null,2)}</pre></details>
       <Overlay name="Research pose overlay" image={row.stage==='raw'?record.raw.input:capture.frame.imageDataUrl} points={row.stage==='raw'?record.raw.landmarks:record.final.landmarks} width={row.stage==='raw'?record.raw.width:record.raw.fullWidth} height={record.raw.height}/>
-      <label>Research label <select aria-label="Research label" value={row.label} onChange={e=>setRows(old=>labelResearch(old,row.id,e.target.value as ResearchLabel,row.note))} className="bg-slate-800">{['UNLABELED','COHERENT','MALFORMED','UNCERTAIN'].map(l=><option key={l}>{l}</option>)}</select></label>
-      <label>Research note <input aria-label="Research note" maxLength={500} value={row.note} onChange={e=>setRows(old=>labelResearch(old,row.id,row.label,e.target.value))} className="bg-slate-800"/></label>
-      <details><summary>Fixed coherence measurements</summary><pre className="text-xs whitespace-pre-wrap">{JSON.stringify(row.measurements,null,2)}</pre></details>
-      <details key={row.id}><summary>Shadow pose diagnostics — reveal after visual labeling</summary>
-        <p>RESEARCH ONLY — NO PRODUCT AUTHORITY</p>
-        <p>No obvious anomaly is not approval. Suspicion is not rejection. Manual labels remain independent.</p>
-        <pre aria-label="Shadow pose assessment" className="text-xs whitespace-pre-wrap">{JSON.stringify(assessPoseCoherence(row.measurements),null,2)}</pre>
-      </details>
-      <details><summary>Raw / final coordinates and provenance</summary><pre className="text-xs whitespace-pre-wrap">{JSON.stringify({authority:'NONE',frameId:row.frameId,timestamp:row.timestamp,source:record.raw.source,passPose:record.raw.passPose,inputDimensions:{width:record.raw.width,height:record.raw.height},cropBounds:{x:record.raw.sx,y:0,width:record.raw.width,height:record.raw.height},rawLandmarks:record.raw.landmarks,rawBbox:{left:Math.min(...record.raw.landmarks.map(p=>p.x))*record.raw.width,top:Math.min(...record.raw.landmarks.map(p=>p.y))*record.raw.height,width:(Math.max(...record.raw.landmarks.map(p=>p.x))-Math.min(...record.raw.landmarks.map(p=>p.x)))*record.raw.width,height:(Math.max(...record.raw.landmarks.map(p=>p.y))-Math.min(...record.raw.landmarks.map(p=>p.y)))*record.raw.height},final:record.final,retained:record.retained,suppressedBy:record.suppressedBy,overlaps:record.overlaps},null,2)}</pre></details>
     </div>}
   </section>
 }
