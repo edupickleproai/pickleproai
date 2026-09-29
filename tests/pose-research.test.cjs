@@ -17,7 +17,9 @@ test('real component frame selection, detection and labeling have no product-sta
   const slots=[];let index=0
   const react={useEffect:()=>{},useState:init=>{const i=index++;if(!(i in slots))slots[i]=init;return[slots[i],v=>{slots[i]=typeof v==='function'?v(slots[i]):v}]},useRef:init=>{const i=index++;if(!(i in slots))slots[i]={current:init};return slots[i]}}
   const jsx=(type,props)=>({type,props})
-  const Component=load('src/app/pose-test/RawPoseResearch.tsx',{'react':react,'react/jsx-runtime':{jsx,jsxs:jsx},'@/lib/pose-research':helpers,'@/lib/research-capture':{...captureHelpers,captureResearchFrame:async(url,time,id)=>Object.freeze({frameId:id,timestampSeconds:time,imageDataUrl:'data:frame',imageFingerprint:captureHelpers.imageFingerprint('data:frame'),timing:{requestedTime:time,actualTime:time,integrity:'VERIFIED'}})}}).default
+  let forcedShadowStatus='NO_OBVIOUS_ANOMALY'
+  const shadow=load('src/lib/pose-coherence.ts')
+  const Component=load('src/app/pose-test/RawPoseResearch.tsx',{'react':react,'react/jsx-runtime':{jsx,jsxs:jsx},'@/lib/pose-research':helpers,'@/lib/pose-coherence':{assessPoseCoherence:m=>({...shadow.assessPoseCoherence(m),status:forcedShadowStatus})},'@/lib/research-capture':{...captureHelpers,captureResearchFrame:async(url,time,id)=>Object.freeze({frameId:id,timestampSeconds:time,imageDataUrl:'data:frame',imageFingerprint:captureHelpers.imageFingerprint('data:frame'),timing:{requestedTime:time,actualTime:time,integrity:'VERIFIED'}})}}).default
   const product={tracking:['anchor'],ledger:['reference'],reacquisition:[],phases:{ready:'f1'},biomechanics:{},coaching:{}}
   const before=JSON.stringify(product)
   const frame=Object.freeze({frameId:'f2',timestampSeconds:2,imageDataUrl:'data:frame'})
@@ -31,6 +33,14 @@ test('real component frame selection, detection and labeling have no product-sta
   const OldImage=global.Image;global.Image=class{set src(v){this._src=v;this.onload()}get src(){return this._src}}
   try{await find(tree,n=>n.type==='button'&&n.props.children==='Inspect research frame').props.onClick()}finally{global.Image=OldImage}
   tree=render();assert.equal(called,1)
+  const stateBeforeShadow=JSON.stringify(slots)
+  forcedShadowStatus='STRONGLY_SUSPICIOUS';tree=render()
+  assert.ok(JSON.stringify(tree).includes('STRONGLY_SUSPICIOUS'))
+  assert.equal(JSON.stringify(slots),stateBeforeShadow)
+  assert.equal(called,1)
+  const shadowPanel=find(tree,n=>n.type==='details'&&JSON.stringify(n).includes('Shadow pose assessment'))
+  assert.equal(shadowPanel.props.open,undefined)
+  assert.ok(JSON.stringify(tree).includes('RESEARCH ONLY — NO PRODUCT AUTHORITY'))
   find(tree,n=>n.props?.['aria-label']==='Research label').props.onChange({target:{value:'COHERENT'}})
   tree=render();const rendered=JSON.stringify(tree)
   assert.ok(rendered.includes('COHERENT'));assert.ok(rendered.includes('LEFT_CROP'));assert.ok(rendered.includes('pass 2')||rendered.includes('pass '))
@@ -39,6 +49,9 @@ test('real component frame selection, detection and labeling have no product-sta
   const rows=slots.find(s=>Array.isArray(s)&&s[0]?.stage)
   assert.equal(rows.length,2);assert.equal(rows[0].captureId,rows[1].captureId);assert.equal(rows[0].poseIndex,7);assert.equal(rows[1].passPose,2)
   assert.equal(rows[1].label,'UNLABELED')
+  assert.equal(rows[0].label,'COHERENT') // Human label is independent even of forced strong suspicion.
+  assert.ok(rows.every(r=>!('shadow' in r)&&!('status' in r)))
+  assert.equal(called,1)
 })
 test('inspector has no storage/API/product mutation capability',()=>{const src=fs.readFileSync(path.resolve(__dirname,'../src/app/pose-test/RawPoseResearch.tsx'),'utf8');assert.doesNotMatch(src,/localStorage|sessionStorage|fetch\(|setPersistent|setReferenceLedger|setAcquisition|setAutoResult|setSelectedFrameByPhase|buildCoaching/);assert.doesNotMatch(src,/from ['"].*(phase-detection|coaching-biomechanics)/)})
 test('authoritative modules remain byte-equivalent to checkpoint',()=>{for(const file of ['src/lib/phase-detection.ts','src/lib/coaching-biomechanics.ts','src/app/pose-test/BiomechanicsPanel.tsx']){const base=execFileSync('git',['show',`c4deadf4d155c8c4c6501453ece41293df64c8cf:${file}`],{encoding:'utf8'});assert.equal(fs.readFileSync(path.resolve(__dirname,'..',file),'utf8').replace(/\r\n/g,'\n'),base.replace(/\r\n/g,'\n'))}})
