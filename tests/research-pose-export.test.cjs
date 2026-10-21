@@ -24,6 +24,35 @@ test('real UI uses only passed evidence, trusted download, and has no production
  function render(){index=0;return UI(f)}function find(node,text){if(!node||typeof node!=='object')return; if(node.type==='button'&&node.props.children===text)return node;for(const c of [node.props?.children].flat(Infinity)){const found=find(c,text);if(found)return found}}
  await find(render(),'Export Complete Pose Evidence').props.onClick();assert.equal(prepared,1);find(render(),'Download complete pose evidence JSON').props.onClick({nativeEvent:{isTrusted:true}});assert.equal(downloaded,1);assert.equal(prepared,1);process.env.NODE_ENV='production';assert.equal(render(),null)
 }))
-test('export integration does not add inference or product dependencies',()=>{const helper=fs.readFileSync('src/lib/research-pose-export.ts','utf8');assert.doesNotMatch(helper,/fetch\(|detect\(|MediaPipe|tracking|coaching|localStorage/);const ui=fs.readFileSync('src/app/pose-test/RawPoseResearch.tsx','utf8');assert.match(ui,/trace=\{capture.trace\}/);assert.match(ui,/process.env.NODE_ENV==='development'&&<VerifiedFrameExport/);})
+test('export integration does not add inference or product dependencies',()=>{const helper=fs.readFileSync('src/lib/research-pose-export.ts','utf8');assert.doesNotMatch(helper,/fetch\(|detect\(|MediaPipe|tracking|coaching|localStorage/);const ui=fs.readFileSync('src/app/pose-test/RawPoseResearch.tsx','utf8');assert.match(ui,/trace=\{exportCapture.trace\}/);assert.match(ui,/process.env.NODE_ENV==='development'&&exportCapture&&<VerifiedFrameExport/);})
+
+test('verified zero-candidate export preserves original bytes and capture identity without fabricated evidence',()=>env(async()=>{
+ const f=fixture();f.trace.records=[];const before=structuredClone(f)
+ const image=await frame.prepareVerifiedFrameExport(f.input),out=await h.prepareCompletePoseEvidence(f.input,f.trace),v=JSON.parse(out.json)
+ assert.deepEqual(v.hypotheses,[]);assert.equal(v.candidateCount,0);assert.deepEqual(v.specialValues,[])
+ assert.deepEqual(v.capture,JSON.parse(await image.provenance.text()));assert.equal(v.capture.captureTransactionId,f.input.frame.frameId)
+ assert.equal(v.capture.requestedTimestamp,1);assert.equal(v.capture.presentedTimestamp,1);assert.equal(v.capture.captureFingerprint,f.input.frame.imageFingerprint)
+ assert.deepEqual([v.capture.width,v.capture.height],[48,32]);assert.deepEqual(Buffer.from(await image.jpeg.arrayBuffer()),Buffer.from('/9j/2Q==','base64'))
+ assert.equal(h.validatePoseEvidence(JSON.parse(await out.blob.text())).candidateCount,0);assert.equal(out.sha256,crypto.createHash('sha256').update(out.json).digest('hex'));assert.deepEqual(f,before)
+}))
+
+test('zero-candidate export retains invalid-capture and production rejection',()=>env(async()=>{
+ for(const mutate of [f=>f.input.frame.timing.integrity='UNVERIFIED',f=>f.input.frame.imageFingerprint='wrong',f=>f.input.frame.timing.attempts[0].transactionId='wrong']){const f=fixture();f.trace.records=[];mutate(f);await assert.rejects(frame.prepareVerifiedFrameExport(f.input));await assert.rejects(h.prepareCompletePoseEvidence(f.input,f.trace))}
+ const f=fixture();f.trace.records=[];process.env.NODE_ENV='production';await assert.rejects(h.prepareCompletePoseEvidence(f.input,f.trace),/development-only/)
+}))
+
+test('research UI exports zero-candidate captures independently of rows and retains nonempty row selection',()=>env(async()=>{
+ const f=fixture(),empty={id:'empty',video:'SYNTHETIC',fingerprint:'synthetic-source',frame:f.input.frame,trace:{sourceImage:f.trace.sourceImage,records:[]}},full={...empty,id:'full',trace:f.trace}
+ let slots=[],index=0;const react={useState:init=>{const i=index++;if(!(i in slots))slots[i]=init;return[slots[i],v=>slots[i]=typeof v==='function'?v(slots[i]):v]},useRef:v=>({current:v}),useEffect(){}}
+ const jsx=(type,props)=>({type,props}),Export=()=>null
+ const UI=load('src/app/pose-test/RawPoseResearch.tsx',{'react':react,'react/jsx-runtime':{jsx,jsxs:jsx},'./ResearchVideoSource':{default:()=>null},'./RawPoseReview':{default:()=>null},'./VerifiedFrameExport':{__esModule:true,default:Export},'@/lib/research-review':{},'@/lib/pose-coherence':{},'@/lib/research-capture':capture,'@/lib/pose-research':{}}).default
+ function find(n,p){if(!n||typeof n!=='object')return;if(p(n))return n;for(const c of [n.props?.children].flat(Infinity)){const x=find(c,p);if(x)return x}}
+ const props={video:'SYNTHETIC',videoUrl:null,fingerprint:null,frames:[],busy:false,detect(){throw Error('must not infer')}}
+ function render(){index=0;return UI(props)}
+ render();slots[3]=[empty,full];slots[6]='empty';let tree=render();assert.equal(find(tree,n=>n.type===Export).props.trace,empty.trace)
+ const select=find(tree,n=>n.props?.['aria-label']==='Captured frame for export');select.props.onChange({target:{value:'full'}});assert.equal(find(render(),n=>n.type===Export).props.trace,full.trace)
+ slots[4]=[{id:'row',captureId:'full',poseIndex:1,stage:'raw',timestamp:1,source:'FULL_FRAME',passPose:1,requestedTime:1,actualTime:1}];slots[5]='row';slots[6]='empty';assert.equal(find(render(),n=>n.type===Export).props.trace,full.trace)
+ slots[4]=[];slots[5]=null;process.env.NODE_ENV='production';assert.equal(find(render(),n=>n.type===Export),undefined)
+}))
 
 

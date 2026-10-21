@@ -36,6 +36,7 @@ export default function RawPoseResearch({video:uploadedVideo,videoUrl:uploadedUr
   const [captures,setCaptures]=useState<Capture[]>([])
   const [rows,setRows]=useState<Row[]>([])
   const [active,setActive]=useState<string|null>(null)
+  const [activeCapture,setActiveCapture]=useState<string|null>(null)
   const [running,setRunning]=useState(false)
   const [message,setMessage]=useState('')
   const [exportText,setExportText]=useState('')
@@ -54,7 +55,7 @@ export default function RawPoseResearch({video:uploadedVideo,videoUrl:uploadedUr
   const changeResearchSource=(next:ResearchVideo|null,ready:boolean)=>{
     controller.current?.abort('SOURCE_CHANGE');transactions.current.cancel()
     setLocalSource(next?{video:next,ready}:null)
-    setSelectedFrame('');setTimestamp('0');setBatchTimes('');setActive(null);setExportText('');setMessage('')
+    setSelectedFrame('');setTimestamp('0');setBatchTimes('');setActive(null);setActiveCapture(null);setExportText('');setMessage('')
     // Completed records retain their original source; in-flight work keeps its lock until it settles.
   }
   const run=async(times:number[])=>{
@@ -85,7 +86,7 @@ export default function RawPoseResearch({video:uploadedVideo,videoUrl:uploadedUr
         const maxIou=Math.max(0,...overlap.map(o=>o.iou))
         return (record.retained?['raw','final']:['raw']).map(stage=>({id:researchId(fingerprint,frame!.frameId,r.source,r.passPose,stage as 'raw'|'final'),captureId:id,video,fingerprint,timestamp:frame!.timestampSeconds,frameId:frame!.frameId,source:r.source,passPose:r.passPose,poseIndex:record.poseIndex,stage:stage as 'raw'|'final',requestedTime:frame.timing.requestedTime,actualTime:frame.timing.actualTime,frameFingerprint:frame.imageFingerprint,detectorInputFingerprint:imageFingerprint(trace.sourceImage),sourceImageFingerprint:imageFingerprint(stage==='raw'?r.input:frame.imageDataUrl),timing:frame.timing,label:'UNLABELED' as ResearchLabel,note:'',measurements:stage==='raw'?measurePose(r.landmarks,r.width,r.height,maxIou):measurePose(record.final.landmarks,r.fullWidth,r.height,maxIou)}))
       })
-      setCaptures(old=>[...old.filter(c=>c.id!==id),capture]);setRows(old=>[...old.filter(r=>r.captureId!==id),...newRows]);setActive(newRows[0]?.id??null)
+      setCaptures(old=>[...old.filter(c=>c.id!==id),capture]);setRows(old=>[...old.filter(r=>r.captureId!==id),...newRows]);setActive(newRows[0]?.id??null);setActiveCapture(id)
       setMessage(`VERIFIED: requested ${frame.timing.requestedTime.toFixed(6)}s; presented ${frame.timing.actualTime.toFixed(6)}s. ${trace.records.length} raw poses; ${trace.records.filter(r=>r.retained).length} retained candidates. No identity assigned.`)
       return frame
       }, result=>{if(diagnosticSession.current===session)setBatchResults(old=>[...old,{...result,video,runId:String(token)}]);if(transactions.current.current(token)&&result.status==='REJECTED')setMessage(result.reason??'Capture rejected.')})
@@ -105,6 +106,7 @@ export default function RawPoseResearch({video:uploadedVideo,videoUrl:uploadedUr
     await run(values)
   }
   const row=rows.find(r=>r.id===active),capture=captures.find(c=>c.id===row?.captureId),record=capture?.trace.records.find(r=>r.poseIndex===row?.poseIndex)
+  const exportCapture=capture??captures.find(c=>c.id===activeCapture)
   const exportRows=()=>{const json=withReviewHistory(researchExport(rows),rows);setExportText(json);downloadResearchJson(json)}
 
   return <section className="my-6 border border-cyan-800 p-4 space-y-3" aria-label="Raw pose research">
@@ -131,11 +133,15 @@ export default function RawPoseResearch({video:uploadedVideo,videoUrl:uploadedUr
     <button disabled={running||!batchResults.length} onClick={()=>downloadResearchJson(JSON.stringify({authority:'NONE',results:batchResults,attempts:attemptLog},null,2),`research-capture-diagnostics-${Date.now()}.json`)}>Export batch diagnostics</button>
     <p role="status">{message}</p>
     <button onClick={exportRows} disabled={running||!rows.length}>Export research JSON (no images)</button>{' '}
-    <button disabled={running} onClick={()=>{diagnosticSession.current++;transactions.current.cancel();setRows([]);setCaptures([]);setActive(null);setExportText('');setMessage('Research session cleared.');setBatchResults([]);setAttemptLog([])}}>Clear research session</button>
+    <button disabled={running} onClick={()=>{diagnosticSession.current++;transactions.current.cancel();setRows([]);setCaptures([]);setActive(null);setActiveCapture(null);setExportText('');setMessage('Research session cleared.');setBatchResults([]);setAttemptLog([])}}>Clear research session</button>
     {exportText&&<details open><summary>Research JSON export preview</summary><p>Download requested. This is a snapshot; export again after edits. If this browser blocks downloads, copy this exact JSON into a file outside the repository.</p><textarea aria-label="Research JSON export" readOnly value={exportText} rows={8} className="w-full bg-slate-900"/></details>}
     <table className="text-xs w-full"><thead><tr>{['Video','Requested / presented','Source','Stage / reference','Label','Note','View'].map(h=><th key={h}>{h}</th>)}</tr></thead><tbody>{rows.map(r=><tr key={r.id}><td>{r.video}</td><td>{r.requestedTime.toFixed(3)} / {r.actualTime.toFixed(6)}</td><td>{r.source}</td><td>{r.stage} · pass {r.passPose} · frame #{r.poseIndex}</td><td>{r.label}</td><td>{r.note}</td><td><button onClick={()=>setActive(r.id)} aria-label={`View ${r.stage} ${r.timestamp.toFixed(3)} ${r.source} ${r.passPose}`}>View</button></td></tr>)}</tbody></table>
+    {process.env.NODE_ENV==='development'&&captures.length>0&&<label>Captured frame for export <select aria-label="Captured frame for export" disabled={running} value={exportCapture?.id??''} onChange={e=>{setActive(null);setActiveCapture(e.target.value)}}>
+      <option value="">Select a capture</option>
+      {captures.map(c=><option key={c.id} value={c.id}>{c.video} · {c.frame.timestampSeconds.toFixed(3)}s · {c.trace.records.length} raw candidates · {c.frame.frameId}</option>)}
+    </select></label>}
+    {process.env.NODE_ENV==='development'&&exportCapture&&<VerifiedFrameExport key={exportCapture.id} input={{videoId:exportCapture.video,sourceId:exportCapture.fingerprint,frame:exportCapture.frame}} trace={exportCapture.trace}/>}
     {row&&capture&&record&&<div>
-      {process.env.NODE_ENV==='development'&&<VerifiedFrameExport key={capture.id} input={{videoId:capture.video,sourceId:capture.fingerprint,frame:capture.frame}} trace={capture.trace}/>}
       <h3>{row.stage==='raw'?'RAW detector input':'FINAL retained full-frame candidate'} · {row.timestamp.toFixed(3)}s · {row.source} · pass {row.passPose}</h3>
       <p>Raw source: {record.raw.source}/{record.raw.passPose} → frame-local #{record.poseIndex}. {record.retained?'Retained by existing dedup':`Suppressed by frame-local #${record.suppressedBy}`}</p>
       <details><summary>Capture integrity</summary><pre aria-label="Capture diagnostics">{JSON.stringify({frameId:row.frameId,frameFingerprint:row.frameFingerprint,detectorInputFingerprint:row.detectorInputFingerprint,sourceImageFingerprint:row.sourceImageFingerprint,width:capture.frame.width,height:capture.frame.height,...row.timing},null,2)}</pre></details>

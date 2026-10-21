@@ -44,7 +44,7 @@ test('download requires trusted active click; URL remains valid through click',(
 }))
 test('UI control is development-gated and export module has no product dependencies',()=>{
  const ui=fs.readFileSync('src/app/pose-test/RawPoseResearch.tsx','utf8'),helper=fs.readFileSync('src/lib/research-frame-export.ts','utf8')
- assert.match(ui,/process\.env\.NODE_ENV==='development'&&<VerifiedFrameExport/)
+ assert.match(ui,/process\.env\.NODE_ENV==='development'&&exportCapture&&<VerifiedFrameExport/)
  assert.doesNotMatch(helper,/drawImage|fetch\(|localStorage|phase-detection|coaching|detect\(/)
  assert.match(fs.readFileSync('src/app/pose-test/VerifiedFrameExport.tsx','utf8'),/nativeEvent\.isTrusted/)
 })
