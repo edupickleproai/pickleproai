@@ -1,7 +1,7 @@
+import { extractRallyFrames, type RallyFrame } from '@/lib/rally-frames'
+import { playerConfirmation, MAX_VIDEO_BYTES, RALLY_LIMITATIONS, type PlayerConfirmation } from '@/lib/rally-evidence'
 import { NextRequest, NextResponse } from 'next/server'
 import { OpenAI } from 'openai'
-import ffmpeg from 'ffmpeg-static'
-import { spawn } from 'child_process'
 import { promises as fs } from 'fs'
 import path from 'path'
 import sharp from 'sharp'
@@ -13,100 +13,7 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 })
 
-const ffmpegPath = process.env.FFMPEG_PATH || ffmpeg
 
-// Configure multer for file uploads
-const multer = require('multer')
-const upload = multer({
-  dest: '/tmp',
-  limits: {
-    fileSize: 100 * 1024 * 1024, // 100MB limit
-  },
-  fileFilter: (req: any, file: any, cb: any) => {
-    if (file.mimetype.startsWith('video/')) {
-      cb(null, true)
-    } else {
-      cb(new Error('Only video files are allowed'))
-    }
-  },
-})
-
-async function extractFrames(videoPath: string, outputDir: string): Promise<string[]> {
-  return new Promise((resolve, reject) => {
-    console.log('Starting FFmpeg frame extraction...')
-    console.log('Video path:', videoPath)
-    console.log('Output dir:', outputDir)
-
-    if (!ffmpegPath) {
-      console.error('FFmpeg not found')
-      reject(new Error('FFmpeg not found'))
-      return
-    }
-
-    // Verify input video path exists
-    console.log('Verifying input video path exists...')
-    if (!fsSync.existsSync(videoPath)) {
-      console.error('Input video path does not exist:', videoPath)
-      reject(new Error('Input video file does not exist'))
-      return
-    }
-    console.log('Input video path exists')
-
-    // Ensure output directory exists
-    console.log('Ensuring output directory exists...')
-    fsSync.mkdirSync(outputDir, { recursive: true })
-    console.log('Output directory ensured')
-
-    // Prepare Windows-safe paths
-    const inputPath = videoPath.replace(/\\/g, '/')
-    const outputPattern = path.join(outputDir, 'frame_%04d.jpg').replace(/\\/g, '/')
-
-    console.log('FFmpeg input path:', inputPath)
-    console.log('FFmpeg output pattern:', outputPattern)
-
-    const ffmpegProcess = spawn(ffmpegPath, [
-      '-y', // Overwrite output files
-      '-i', inputPath,
-      '-vf', 'fps=1/2', // 1 frame every 2 seconds
-      '-q:v', '2', // Good quality
-      outputPattern
-    ])
-
-    let stderr = ''
-    ffmpegProcess.stderr.on('data', (data) => {
-      const chunk = data.toString()
-      console.log('FFmpeg stderr chunk:', chunk.trim())
-      stderr += chunk
-    })
-
-    ffmpegProcess.on('close', async (code) => {
-      console.log('FFmpeg process exited with code:', code)
-      if (code === 0) {
-        try {
-          const files = await fs.readdir(outputDir)
-          const framePaths = files
-            .filter(file => file.startsWith('frame_') && file.endsWith('.jpg'))
-            .map(file => path.join(outputDir, file))
-            .sort()
-          console.log('Extracted frames:', framePaths.length)
-          resolve(framePaths)
-        } catch (readError) {
-          console.error('Error reading output directory:', readError)
-          reject(new Error('Failed to read extracted frames'))
-        }
-      } else {
-        console.error('FFmpeg failed with exit code:', code)
-        console.error('Full FFmpeg stderr output:', stderr)
-        reject(new Error(`FFmpeg processing failed with code ${code}: ${stderr}`))
-      }
-    })
-
-    ffmpegProcess.on('error', (error) => {
-      console.error('FFmpeg spawn error:', error)
-      reject(new Error(`FFmpeg spawn failed: ${error.message}`))
-    })
-  })
-}
 
 type IdentifiedPlayer = {
   playerId: string | null
@@ -122,6 +29,7 @@ type IdentifiedPlayer = {
     height: number | null
   } | null
   confidence: number | null
+  identityUncertain?: boolean
 }
 
 type TargetPlayerMetadata = {
@@ -139,8 +47,9 @@ type TargetPlayerMetadata = {
   } | null
 }
 
-async function prepareFrameImages(frames: string[]) {
-  const framePromises = frames.slice(0, 5).map(async (framePath, index) => {
+async function prepareFrameImages(frames: RallyFrame[]) {
+  const framePromises = frames.map(async (frame, index) => {
+    const framePath = frame.path
     try {
       console.log(`Processing frame ${index + 1}:`, framePath)
       const buffer = await fs.readFile(framePath)
@@ -152,12 +61,12 @@ async function prepareFrameImages(frames: string[]) {
         .toBuffer()
       console.log(`Frame ${index + 1} resized successfully, new size:`, resizedBuffer.length)
 
-      return {
+      return [{ type: 'text' as const, text: `Sample ${index + 1}: actual decoded time ${frame.timestamp.toFixed(6)} seconds.` }, {
         type: 'image_url' as const,
         image_url: {
-          url: `data:image/jpeg;base64,${resizedBuffer.toString('base64')}`,
+          url: `data:image/jpeg;base64,${resizedBuffer.toString('base64')}`, detail: 'low' as const,
         },
-      }
+      }]
     } catch (frameError) {
       console.error(`Error processing frame ${framePath}:`, frameError)
       throw new Error(`Frame processing failed for ${path.basename(framePath)}: ${frameError.message}`)
@@ -166,7 +75,7 @@ async function prepareFrameImages(frames: string[]) {
 
   const imageContents = await Promise.all(framePromises)
   console.log('All frames processed successfully')
-  return imageContents
+  return imageContents.flat()
 }
 
 function cleanText(text: string): string {
@@ -218,6 +127,7 @@ function parseIdentifiedPlayerResponse(responseText: string): IdentifiedPlayer {
             }
           : null,
         confidence: parsed.confidence != null ? Number(parsed.confidence) : null,
+        identityUncertain: parsed.identityUncertain !== false,
       }
     } catch (parseError) {
       console.warn('Failed to parse JSON from identifyTargetPlayer response:', parseError)
@@ -352,11 +262,13 @@ function parseAnalysisResponse(analysis: string) {  const targetPlayerMatch = an
   return parsedAnalysis
 }
 
-async function identifyTargetPlayer(frames: string[], targetPlayerDescription: string, notes: string): Promise<IdentifiedPlayer> {
+async function identifyTargetPlayer(frames: RallyFrame[], targetPlayerDescription: string, notes: string): Promise<IdentifiedPlayer> {
   console.log('Starting phase 1: identify target player')
   const imageContents = await prepareFrameImages(frames)
 
-  const systemPrompt = `You are an expert pickleball footage analyst. Use the frames and user notes to infer observable player attributes. Do NOT repeat the user's wording back as the main identification. Do NOT provide coaching, scoring, diagnosis, or drills. Return only a JSON object with these fields: playerId, description, shirtColors, shortsColor, handedness, courtSide, approximateBoundingBox, confidence.`
+  const systemPrompt = `You are an expert pickleball footage analyst. Use the frames and user notes to infer observable player attributes. Do NOT repeat the user's wording back as the main identification. Do NOT provide coaching, scoring, diagnosis, or drills. Return only a JSON object with these fields: playerId, description, shirtColors, shortsColor, handedness, courtSide, approximateBoundingBox, confidence, identityUncertain. identityUncertain must be true unless you can reliably associate the intended player across the supplied samples. These attributes are model-inferred, not user-confirmed tracking.
+
+${RALLY_LIMITATIONS}`
   const userPrompt = `Target Player Instruction: "${targetPlayerDescription}"
 User Notes: "${notes}"
 From the provided frames, infer which player is the target and describe observable attributes, including shirt colors, shorts color, handedness, court side, and an approximate bounding box.`
@@ -381,7 +293,7 @@ From the provided frames, infer which player is the target and describe observab
 
 async function analyzeTrackedPlayer(
   identifiedPlayer: IdentifiedPlayer,
-  frames: string[],
+  frames: RallyFrame[],
   category: string,
   notes: string,
   userProfile: any,
@@ -392,10 +304,11 @@ async function analyzeTrackedPlayer(
   console.log('Starting phase 2: analyze tracked player')
   const imageContents = await prepareFrameImages(frames)
 
-  const systemPrompt = `You are an elite pickleball coach analyzing video footage for a single identified player. Analyze ONLY the player described by the structured identification object. Do not re-identify the player or provide any additional player selection guidance. Use supplied COACHING ELIGIBLE biomechanics as trusted facts. Treat COACHING ELIGIBLE — REVIEW biomechanics cautiously and acknowledge uncertainty when material. Never invent or infer omitted biomechanics measurements.`
+  const systemPrompt = `${RALLY_LIMITATIONS} You are an elite pickleball coach analyzing video footage for a single identified player. Analyze ONLY the player described by the structured identification object. Do not re-identify the player or provide any additional player selection guidance. Use supplied COACHING ELIGIBLE biomechanics as trusted facts. Treat COACHING ELIGIBLE — REVIEW biomechanics cautiously and acknowledge uncertainty when material. Never invent or infer omitted biomechanics measurements.`
 
   const analysisPrompt = `Analyzing only the player described by the structured identification object below:
 
+Model-inferred attributes (not a permanent tracking identity):
 Player ID: ${identifiedPlayer.playerId || 'unknown'}
 Description: ${identifiedPlayer.description || 'unknown'}
 Shirt Colors: ${identifiedPlayer.shirtColors || 'unknown'}
@@ -415,6 +328,7 @@ User Profile:
 User Notes: "${notes}"
 Category: ${category}
 Target Player Selection: ${targetPlayerSelection}
+${targetPlayerDescription}
 
 ${formatCoachingBiomechanicsForPrompt(coachingBiomechanics)}
 
@@ -484,12 +398,16 @@ Keep all feedback concise, technical, and actionable.`
   return { ...parsedAnalysis, diagnosis: addCoachingReviewNotice(parsedAnalysis.diagnosis, coachingBiomechanics) }
 }
 
-async function analyzeFramesWithVision(frames: string[], category: string, notes: string, userProfile: any, targetPlayerSelection: string, targetPlayerDescription: string, coachingBiomechanics: CoachingBiomechanicsPayload | null): Promise<any> {
+async function analyzeFramesWithVision(frames: RallyFrame[], category: string, notes: string, userProfile: any, targetPlayerSelection: string, targetPlayerDescription: string, coachingBiomechanics: CoachingBiomechanicsPayload | null): Promise<any> {
   try {
     const identifiedPlayer = await identifyTargetPlayer(frames, targetPlayerDescription, notes)
+    if (identifiedPlayer.identityUncertain !== false || !identifiedPlayer.description?.trim()) {
+      return { ...parseAnalysisResponse(''), diagnosis: 'Not enough evidence to follow the confirmed player across these samples. No player-specific coaching was generated.', targetPlayerIdentified: 'Identity uncertain across sampled frames.', identityUncertain: true }
+    }
     const trackedAnalysis = await analyzeTrackedPlayer(identifiedPlayer, frames, category, notes, userProfile, targetPlayerSelection, targetPlayerDescription, coachingBiomechanics)
     return {
       ...trackedAnalysis,
+      identityUncertain: false,
       targetPlayerMetadata: {
         playerId: identifiedPlayer.playerId,
         shirtColors: identifiedPlayer.shirtColors,
@@ -526,6 +444,11 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'No video file provided' }, { status: 400 })
     }
 
+    if (typeof videoFile === 'string' || !videoFile.type.startsWith('video/') || videoFile.size <= 0 || videoFile.size > MAX_VIDEO_BYTES) return NextResponse.json({ error: 'Select a video no larger than 100 MB.' }, { status: 400 })
+    let confirmedPlayer: PlayerConfirmation
+    try { confirmedPlayer = playerConfirmation(JSON.parse(String(formData.get('playerConfirmation') || 'null'))) }
+    catch { return NextResponse.json({ error: 'Confirm the intended player and description before analysis.' }, { status: 400 }) }
+
     // Create temporary directory for processing (cross-platform)
     tempDir = path.join(os.tmpdir(), `video-analysis-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`)
     console.log('Creating temp directory:', tempDir)
@@ -559,7 +482,10 @@ export async function POST(request: NextRequest) {
       fsSync.mkdirSync(framesDir, { recursive: true })
       console.log('Frames directory created')
 
-      const framePaths = await extractFrames(videoPath, framesDir)
+      let sampling: Awaited<ReturnType<typeof extractRallyFrames>>
+      try { sampling = await extractRallyFrames(videoPath, framesDir) }
+      catch (error) { return NextResponse.json({ error: error instanceof Error ? error.message : 'Could not verify video coverage.' }, { status: 422 }) }
+      const framePaths = sampling.frames
       console.log('Frame extraction completed, frames found:', framePaths.length)
 
       if (framePaths.length === 0) {
@@ -568,15 +494,16 @@ export async function POST(request: NextRequest) {
       }
 
       const framePreviews = await Promise.all(
-        framePaths.slice(0, 3).map(async (framePath, index) => {
-          const buffer = await fs.readFile(framePath)
+        framePaths.map(async (frame, index) => {
+          const buffer = await fs.readFile(frame.path)
           const optimized = await sharp(buffer)
             .resize({ width: 640, height: 360, fit: 'inside', withoutEnlargement: true })
             .jpeg({ quality: 72 })
             .toBuffer()
 
           return {
-            label: `Sampled frame ${index + 1}`,
+            label: `Sample ${index + 1} · ${frame.timestamp.toFixed(3)}s`,
+            timestamp: frame.timestamp,
             src: `data:image/jpeg;base64,${optimized.toString('base64')}`,
           }
         })
@@ -585,7 +512,7 @@ export async function POST(request: NextRequest) {
       // Analyze with OpenAI Vision
       console.log('Starting OpenAI Vision analysis...')
       const targetPlayerSelection = formData.get('targetPlayerSelection') as string || 'auto-detect'
-      const targetPlayerDescription = formData.get('targetPlayerDescription') as string || ''
+      const targetPlayerDescription = `User-confirmed selection: ${JSON.stringify(confirmedPlayer)}. Total video duration: ${sampling.duration}s. The first sample corresponds to the representative start frame. ${RALLY_LIMITATIONS}`
       const analysis = await analyzeFramesWithVision(framePaths, category, notes, userProfile, targetPlayerSelection, targetPlayerDescription, coachingBiomechanics)
       console.log('Analysis completed successfully')
 
@@ -594,6 +521,8 @@ export async function POST(request: NextRequest) {
         analysis: {
           ...analysis,
           frames: framePreviews,
+          coverage: { duration: sampling.duration, timestamps: framePaths.map(f => f.timestamp), count: framePaths.length, limitations: RALLY_LIMITATIONS },
+          confirmedPlayer,
         },
       })
 

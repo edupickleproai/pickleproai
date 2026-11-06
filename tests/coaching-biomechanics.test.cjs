@@ -18,6 +18,8 @@ function load(relative, mocks = {}) {
   }).outputText, filename)
   return mod.exports
 }
+const rally = load('src/lib/rally-evidence.ts')
+const frameMock = { extractRallyFrames: async () => ({duration:10, frames:[{path:'test.jpg',timestamp:0}]}) }
 const bio = load('src/lib/coaching-biomechanics.ts')
 const evidence = load('src/lib/coach-evidence.ts', { './coaching-biomechanics': bio })
 const metric = (overrides = {}) => ({ metric: 'leftKneeFlexion', value: 30, unit: 'degrees', status: 'coaching_eligible', warnings: [], ...overrides })
@@ -126,7 +128,7 @@ test('both real API handlers independently sanitize before OpenAI prompt constru
   class FakeOpenAI {
     chat = { completions: { create: async (request) => {
       requests.push(request)
-      return { choices: [{ message: { content: JSON.stringify({ playerId: 'TARGET_A', description: 'test player', confidence: 0.9, diagnosis: 'test' }) } }] }
+      return { choices: [{ message: { content: JSON.stringify({ playerId: 'TARGET_A', description: 'test player', confidence: 0.9, identityUncertain: false, diagnosis: 'test' }) } }] }
     } } }
   }
   const { EventEmitter } = require('node:events')
@@ -134,6 +136,7 @@ test('both real API handlers independently sanitize before OpenAI prompt constru
     writeFile: async () => {}, readFile: async () => Buffer.from('test image'), readdir: async () => ['frame_0001.jpg'], rm: async () => {},
   } }
   const mocks = {
+    '@/lib/rally-evidence': rally, '@/lib/rally-frames': frameMock,
     '@/lib/coaching-biomechanics': bio,
     '@/lib/coach-evidence': evidence,
     openai: { __esModule: true, default: FakeOpenAI, OpenAI: FakeOpenAI },
@@ -157,10 +160,11 @@ test('both real API handlers independently sanitize before OpenAI prompt constru
     for (const name of ['A.mp4', 'B.mp4']) {
       requests.length = 0
       const form = new FormData()
-      form.set('video', new File(['abc'], name, { lastModified: 100 }))
+      form.set('video', new File(['abc'], name, { lastModified: 100, type: 'video/mp4' }))
       form.set('videoLastModified', '100')
       form.set('coachingBiomechanics', JSON.stringify(p))
       form.set('notes', 'Test')
+      form.set('playerConfirmation', JSON.stringify({confirmed:true,kind:'user-confirmed',description:'test player',representativeTime:0,point:null,coordinateBasis:'normalized-displayed-frame',trackingEstablished:false}))
       const result = await video.POST(new Request('http://localhost/api/video-analysis', { method: 'POST', body: form }))
       assert.equal(result.status, 200)
       const resultBody = await result.json()

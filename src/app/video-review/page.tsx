@@ -1,6 +1,8 @@
 'use client'
 
 import { useEffect, useMemo, useState, type FormEvent } from 'react'
+import PlayerConfirmation from './PlayerConfirmation'
+import { MAX_VIDEO_BYTES, type PlayerConfirmation as Confirmation } from '@/lib/rally-evidence'
 import { Send, Upload, Video } from 'lucide-react'
 import { appendVideoBiomechanics } from '@/lib/coaching-biomechanics'
 
@@ -36,16 +38,6 @@ type UserProfile = {
 
 type VideoCategory = 'serve' | 'return' | 'dink' | 'volley' | 'footwork' | 'match-point' | 'general'
 
-type TargetPlayerSelection =
-  | 'auto-detect'
-  | 'closest-camera'
-  | 'farthest-camera'
-  | 'left'
-  | 'right'
-  | 'red-green-shirt'
-  | 'white-shirt'
-  | 'manual'
-
 type FramePreview = {
   label: string
   src: string
@@ -71,6 +63,7 @@ type Feedback = {
   score: number | null
   scoreBreakdown: ScoreBreakdown
   scoreExplanation: string
+  coverage?: { duration: number; timestamps: number[]; count: number; limitations: string }
   frames?: FramePreview[]
 }
 
@@ -108,6 +101,7 @@ function normalizeVideoFeedback(raw: Partial<Feedback>): Feedback {
     scoreBreakdown,
     scoreExplanation: raw.scoreExplanation || 'Not enough evidence for an explanation.',
     frames: raw.frames || [],
+    coverage: raw.coverage,
   }
 }
 
@@ -115,37 +109,13 @@ export default function VideoReviewPage() {
   const [videoFile, setVideoFile] = useState<File | null>(null)
   const [category, setCategory] = useState<VideoCategory>('general')
   const [notes, setNotes] = useState('')
-  const [targetPlayerSelection, setTargetPlayerSelection] = useState<TargetPlayerSelection>('auto-detect')
-  const [manualTargetDescription, setManualTargetDescription] = useState('')
   const [status, setStatus] = useState<'idle' | 'analyzing' | 'error'>('idle')
   const [error, setError] = useState('')
   const [feedback, setFeedback] = useState<Feedback | null>(null)
   const [profile, setProfile] = useState<UserProfile>({ skillLevel: 'Intermediate', dominantHand: 'Right', playStyle: 'Balanced', goals: ['Improve consistency'], weaknesses: [] })
 
-  const targetPlayerOptions: { value: TargetPlayerSelection; label: string }[] = [
-    { value: 'auto-detect', label: 'Auto-detect from notes/video' },
-    { value: 'closest-camera', label: 'Player closest to the camera' },
-    { value: 'farthest-camera', label: 'Player farthest from the camera' },
-    { value: 'left', label: 'Player on the left side of the frame' },
-    { value: 'right', label: 'Player on the right side of the frame' },
-    { value: 'red-green-shirt', label: 'Player in red/green shirt' },
-    { value: 'white-shirt', label: 'Player in white shirt' },
-    { value: 'manual', label: 'Other / describe manually' },
-  ]
-
-  const buildTargetPlayerDescription = () => {
-    const trimmedManual = manualTargetDescription.trim()
-    if (targetPlayerSelection === 'manual' && trimmedManual) {
-      return trimmedManual
-    }
-
-    const selectionLabel = targetPlayerOptions.find((option) => option.value === targetPlayerSelection)?.label ?? 'Auto-detect from notes/video'
-    if (notes.trim()) {
-      return `${selectionLabel}. Use the user notes to identify the player: ${notes.trim()}`
-    }
-
-    return selectionLabel
-  }
+  const [confirmedPlayer, setConfirmedPlayer] = useState<Confirmation | null>(null)
+  const [fileVersion, setFileVersion] = useState(0)
 
   useEffect(() => {
     try {
@@ -171,13 +141,18 @@ export default function VideoReviewPage() {
 
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
-    if (file && file.type.startsWith('video/')) {
-      setVideoFile(file)
-    }
+    setConfirmedPlayer(null)
+    setFeedback(null)
+    setFileVersion(v => v + 1)
+    setVideoFile(null)
+    if (!file) return
+    if (!file.type.startsWith('video/') || file.size <= 0 || file.size > MAX_VIDEO_BYTES) { setError('Select a video no larger than 100 MB.'); return }
+    setError('')
+    setVideoFile(file)
   }
 
   const getAIFeedback = async () => {
-    if (!notes.trim()) return
+    if (!notes.trim() || !videoFile || !confirmedPlayer) { setError('Upload a supported rally and confirm the intended player first.'); return }
 
     setStatus('analyzing')
     setError('')
@@ -193,8 +168,8 @@ export default function VideoReviewPage() {
       }
       formData.append('category', category)
       formData.append('notes', notes.trim())
-      formData.append('targetPlayerSelection', targetPlayerSelection)
-      formData.append('targetPlayerDescription', buildTargetPlayerDescription())
+      formData.append('targetPlayerSelection', 'user-confirmed')
+      formData.append('playerConfirmation', JSON.stringify(confirmedPlayer))
       formData.append('userProfile', JSON.stringify(profile))
       const sentCoachingBiomechanics = videoFile && process.env.NODE_ENV !== 'production'
         ? appendVideoBiomechanics(formData, videoFile, () => window.localStorage)
@@ -279,6 +254,7 @@ export default function VideoReviewPage() {
                     type="file"
                     accept="video/*"
                     onChange={handleFileChange}
+                    disabled={status === 'analyzing'}
                     className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
                   />
                   <div className="flex items-center justify-center w-full h-32 border-2 border-dashed border-white/20 rounded-lg hover:border-white/40 transition-colors">
@@ -320,32 +296,8 @@ export default function VideoReviewPage() {
                 </select>
               </div>
 
-              {/* Target Player Selection */}
-              <div className="space-y-3">
-                <label className="block text-sm font-medium text-slate-300">
-                  Which player should the AI analyze?
-                </label>
-                <select
-                  value={targetPlayerSelection}
-                  onChange={(e) => setTargetPlayerSelection(e.target.value as TargetPlayerSelection)}
-                  className="w-full px-3 py-2 bg-[#0B1321]/[0.95] border border-white/10 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-[#57FF00]/50"
-                >
-                  {targetPlayerOptions.map((option) => (
-                    <option key={option.value} value={option.value} className="bg-[#0B1321]">
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-                {targetPlayerSelection === 'manual' && (
-                  <textarea
-                    value={manualTargetDescription}
-                    onChange={(e) => setManualTargetDescription(e.target.value)}
-                    placeholder="Describe the target player: e.g., 'The player in the red shirt on the left side', 'The closer player with right-handed grip'"
-                    rows={3}
-                    className="w-full px-3 py-2 bg-[#0B1321]/[0.95] border border-white/10 rounded-lg text-white placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-[#57FF00]/50 resize-none"
-                  />
-                )}
-              </div>
+              {videoFile && <fieldset disabled={status === 'analyzing'}><PlayerConfirmation key={fileVersion} file={videoFile} onChange={setConfirmedPlayer} /></fieldset>}
+              <p className="text-sm text-slate-400">Analysis uses at most eight ordered samples spanning the rally, not every frame. Player identity and unseen actions may remain uncertain.</p>
 
               {/* Notes */}
               <div className="space-y-3">
@@ -363,7 +315,7 @@ export default function VideoReviewPage() {
 
               <button
                 onClick={getAIFeedback}
-                disabled={status === 'analyzing' || !notes.trim()}
+                disabled={status === 'analyzing' || !notes.trim() || !confirmedPlayer || !videoFile}
                 className="w-full flex items-center justify-center gap-2 px-6 py-3 bg-[#57FF00] text-[#07120c] font-semibold rounded-lg hover:bg-[#4ee100] disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
                 {status === 'analyzing' ? (
@@ -572,6 +524,7 @@ export default function VideoReviewPage() {
                     </div>
                   )}
 
+                  {feedback.coverage && <p className="text-sm text-slate-400">Sampled {feedback.coverage.count} frames over {feedback.coverage.duration.toFixed(2)}s at {feedback.coverage.timestamps.map(t => t.toFixed(3) + 's').join(', ')}. {feedback.coverage.limitations}</p>}
                   {feedback.frames?.length > 0 && (
                     <div>
                       <h4 className="font-semibold text-[#57FF00] text-sm uppercase tracking-wider mb-4">Analyzed Frames</h4>

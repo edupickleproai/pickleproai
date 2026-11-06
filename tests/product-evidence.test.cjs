@@ -19,10 +19,12 @@ function load(relative, mocks = {}, expose = "") {
   return mod.exports
 }
 
+const rally = load('src/lib/rally-evidence.ts')
+const frameMock = { extractRallyFrames: async () => ({duration:10, frames:[{path:'test.jpg',timestamp:0}]}) }
 const bio = load('src/lib/coaching-biomechanics.ts')
 const evidence = load('src/lib/coach-evidence.ts', {'./coaching-biomechanics':bio})
 class FakeOpenAI { chat={completions:{create:async()=>({choices:[{message:{content:'Diagnosis: General practice only'}}]})}} }
-const mocks={'@/lib/coaching-biomechanics':bio,'@/lib/coach-evidence':evidence,openai:{__esModule:true,default:FakeOpenAI,OpenAI:FakeOpenAI}}
+const mocks={'@/lib/rally-evidence':rally,'@/lib/rally-frames':frameMock,'@/lib/coaching-biomechanics':bio,'@/lib/coach-evidence':evidence,openai:{__esModule:true,default:FakeOpenAI,OpenAI:FakeOpenAI}}
 const parse=load('src/app/api/video-analysis/route.ts',mocks,'exports.parse = parseAnalysisResponse').parse
 test('missing scores stay unavailable; valid and partial scores survive without fabricated categories',()=>{
  const empty=parse('Technical Diagnosis: Insufficient evidence')
@@ -37,8 +39,8 @@ test('report renders N/A and original images, never illustrative detection overl
  const React=require('react');const {renderToStaticMarkup}=require('react-dom/server')
  let i=0
  const input={score:null,scoreBreakdown:{footwork:8,positioning:null,paddlePrep:null,timing:null,consistency:null},diagnosis:'Insufficient evidence',drills:[],frames:[{label:'Sampled frame 1',src:'data:image/jpeg;base64,YQ=='}]}
- const react={...React,useState:(initial)=>[i++===7?input:initial,()=>{}],useEffect:()=>{},useMemo:fn=>fn()}
- const page=load('src/app/video-review/page.tsx',{'react':react,'@/lib/coaching-biomechanics':bio},'exports.normalize = normalizeVideoFeedback')
+ const react={...React,useState:(initial)=>[i++===5?input:initial,()=>{}],useEffect:()=>{},useMemo:fn=>fn()}
+ const page=load('src/app/video-review/page.tsx',{'react':react,'@/lib/coaching-biomechanics':bio,'@/lib/rally-evidence':rally,'./PlayerConfirmation':{__esModule:true,default:()=>null}},'exports.normalize = normalizeVideoFeedback')
  assert.equal(page.normalize({}).score,null)
  assert.equal(page.normalize({scoreBreakdown:{footwork:Infinity}}).scoreBreakdown.footwork,null)
  assert.equal(page.normalize({scoreBreakdown:{footwork:8}}).score,8)
