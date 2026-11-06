@@ -348,29 +348,6 @@ function parseAnalysisResponse(analysis: string) {  const targetPlayerMatch = an
   const validScores = Object.values(scoreBreakdown).filter((v): v is number => typeof v === 'number' && v >= 1 && v <= 10)
   let overallScore = validScores.length > 0 ? Math.round(validScores.reduce((a, b) => a + b, 0) / validScores.length) : null
 
-  if (validScores.length === 0) {
-    const diagnosisLength = parsedAnalysis.diagnosis?.length || 0
-    const hasTechnicalTerms = /footwork|positioning|paddle|timing|consistency|stance|recovery|contact|posture/i.test(parsedAnalysis.diagnosis || '')
-    const baseScore = diagnosisLength > 200 && hasTechnicalTerms ? 7 : diagnosisLength > 100 ? 6 : 5
-
-    scoreBreakdown.footwork = Math.max(1, Math.min(10, baseScore + Math.floor(Math.random() * 3) - 1))
-    scoreBreakdown.positioning = Math.max(1, Math.min(10, baseScore + Math.floor(Math.random() * 3) - 1))
-    scoreBreakdown.paddlePrep = Math.max(1, Math.min(10, baseScore + Math.floor(Math.random() * 3) - 1))
-    scoreBreakdown.timing = Math.max(1, Math.min(10, baseScore + Math.floor(Math.random() * 3) - 1))
-    scoreBreakdown.consistency = Math.max(1, Math.min(10, baseScore + Math.floor(Math.random() * 3) - 1))
-
-    overallScore = Math.round(Object.values(scoreBreakdown).reduce((a, b) => a + (b || 0), 0) / 5)
-  } else {
-    const baseScore = 6
-    if (scoreBreakdown.footwork === null) scoreBreakdown.footwork = Math.max(1, Math.min(10, baseScore + Math.floor(Math.random() * 3) - 1))
-    if (scoreBreakdown.positioning === null) scoreBreakdown.positioning = Math.max(1, Math.min(10, baseScore + Math.floor(Math.random() * 3) - 1))
-    if (scoreBreakdown.paddlePrep === null) scoreBreakdown.paddlePrep = Math.max(1, Math.min(10, baseScore + Math.floor(Math.random() * 3) - 1))
-    if (scoreBreakdown.timing === null) scoreBreakdown.timing = Math.max(1, Math.min(10, baseScore + Math.floor(Math.random() * 3) - 1))
-    if (scoreBreakdown.consistency === null) scoreBreakdown.consistency = Math.max(1, Math.min(10, baseScore + Math.floor(Math.random() * 3) - 1))
-
-    overallScore = Math.round(Object.values(scoreBreakdown).reduce((a, b) => a + (b || 0), 0) / 5)
-  }
-
   parsedAnalysis.score = overallScore
   return parsedAnalysis
 }
@@ -475,7 +452,7 @@ Paddle Preparation: [2 sentences explaining score based on Contact Point observa
 Timing: [2 sentences explaining score based on swing tempo and contact timing]
 Consistency: [2 sentences explaining score based on overall movement pattern consistency]
 
-IMPORTANT: Always provide a score 1-10 for each category. Do not skip any scores. All scores must be justified by visible evidence from the frames.
+IMPORTANT: Provide a score 1-10 only when justified by visible evidence. Otherwise write N/A. Do not invent missing observations or measurements.
 Do not include an overall score calculation - the UI will calculate that.
 Keep all feedback concise, technical, and actionable.`
 
@@ -540,7 +517,7 @@ export async function POST(request: NextRequest) {
     const category = formData.get('category') as string
     const notes = formData.get('notes') as string
     const userProfile = JSON.parse(formData.get('userProfile') as string || '{}')
-    const coachingBiomechanics = readVideoBiomechanicsForm(formData)
+    const coachingBiomechanics = process.env.NODE_ENV === 'production' ? null : readVideoBiomechanicsForm(formData)
 
     console.log('Form data parsed:', { hasVideo: !!videoFile, category, notes: !!notes, hasProfile: !!userProfile })
 
@@ -590,7 +567,6 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: 'No frames extracted from video' }, { status: 500 })
       }
 
-      const previewLabels = ['Ready Position', 'Contact Point', 'Recovery Step']
       const framePreviews = await Promise.all(
         framePaths.slice(0, 3).map(async (framePath, index) => {
           const buffer = await fs.readFile(framePath)
@@ -600,7 +576,7 @@ export async function POST(request: NextRequest) {
             .toBuffer()
 
           return {
-            label: previewLabels[index] ?? `Frame ${index + 1}`,
+            label: `Sampled frame ${index + 1}`,
             src: `data:image/jpeg;base64,${optimized.toString('base64')}`,
           }
         })

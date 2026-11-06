@@ -11,7 +11,7 @@ export async function POST(request: Request) {
   const weaknesses = Array.isArray(body?.weaknesses) ? body.weaknesses.join(', ') : String(body?.weaknesses || 'none specified')
   const dominantHand = String(body?.dominantHand || 'right')
   const playStyle = String(body?.playStyle || 'balanced')
-  const coachingBiomechanics = sanitizeCoachingBiomechanicsPayload(body?.coachingBiomechanics)
+  const coachingBiomechanics = process.env.NODE_ENV === 'production' ? null : sanitizeCoachingBiomechanicsPayload(body?.coachingBiomechanics)
   const evidence = buildCoachEvidence(message, coachingBiomechanics)
 
   if (!message) {

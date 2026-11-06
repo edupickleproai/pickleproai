@@ -89,7 +89,7 @@ export default function CoachPage() {
 
     try {
       console.log("Sending message to /api/coach")
-      const coachingBiomechanics = readStoredCoachingBiomechanics(() => window.localStorage) ?? undefined
+      const coachingBiomechanics = process.env.NODE_ENV === 'production' ? undefined : readStoredCoachingBiomechanics(() => window.localStorage) ?? undefined
       if (process.env.NODE_ENV !== 'production') {
         console.info('[dev] /api/coach sanitized coaching biomechanics payload:', JSON.stringify(coachingBiomechanics ?? null))
       }

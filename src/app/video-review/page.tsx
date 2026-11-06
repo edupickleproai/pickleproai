@@ -51,17 +51,12 @@ type FramePreview = {
   src: string
 }
 
-type AnnotatedFrame = FramePreview & {
-  annotatedSrc?: string
-  annotationError?: string
-}
-
 type ScoreBreakdown = {
-  footwork: number
-  positioning: number
-  paddlePrep: number
-  timing: number
-  consistency: number
+  footwork: number | null
+  positioning: number | null
+  paddlePrep: number | null
+  timing: number | null
+  consistency: number | null
 }
 
 type Feedback = {
@@ -73,157 +68,32 @@ type Feedback = {
   biggestIssue: string
   improveFirst: string
   drills: string[]
-  score: number
+  score: number | null
   scoreBreakdown: ScoreBreakdown
   scoreExplanation: string
   frames?: FramePreview[]
 }
 
-async function createAnnotatedSrc(frame: FramePreview): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const img = new Image()
-    img.crossOrigin = 'anonymous'
-    img.onload = () => {
-      const scale = Math.min(960 / img.width, 1)
-      const width = Math.round(img.width * scale)
-      const height = Math.round(img.height * scale)
-      const canvas = document.createElement('canvas')
-      canvas.width = width
-      canvas.height = height
-      const ctx = canvas.getContext('2d')
-
-      if (!ctx) {
-        reject(new Error('Canvas context not available'))
-        return
-      }
-
-      ctx.imageSmoothingEnabled = true
-      ctx.drawImage(img, 0, 0, width, height)
-
-      const label = frame.label || 'Frame'
-      const lowerLabel = label.toLowerCase()
-      const centerX = width * 0.55
-      const centerY = height * 0.45
-      const highlightW = width * 0.24
-      const highlightH = height * 0.36
-
-      ctx.save()
-      ctx.fillStyle = 'rgba(87,255,0,0.12)'
-      ctx.strokeStyle = '#57FF00'
-      ctx.lineWidth = 6
-      ctx.beginPath()
-      ctx.ellipse(centerX, centerY, highlightW, highlightH, 0, 0, Math.PI * 2)
-      ctx.fill()
-      ctx.stroke()
-      ctx.restore()
-
-      const textX = width * 0.08
-      const textY = height * 0.15
-      ctx.save()
-      ctx.font = `600 ${Math.max(16, Math.round(width * 0.035))}px Inter, sans-serif`
-      ctx.textBaseline = 'top'
-      const text = lowerLabel.includes('contact')
-        ? 'Good Contact Point'
-        : lowerLabel.includes('ready')
-        ? 'Ready Position'
-        : lowerLabel.includes('recovery')
-        ? 'Move Forward'
-        : frame.label
-      const metrics = ctx.measureText(text)
-      const padding = 12
-      ctx.fillStyle = 'rgba(0,0,0,0.75)'
-      ctx.fillRect(textX - 10, textY - 8, metrics.width + padding, parseInt(ctx.font, 10) + padding)
-      ctx.fillStyle = '#57FF00'
-      ctx.fillText(text, textX, textY)
-      ctx.restore()
-
-      const drawArrow = (fromX: number, fromY: number, toX: number, toY: number, color: string) => {
-        ctx.save()
-        ctx.strokeStyle = color
-        ctx.fillStyle = color
-        ctx.lineWidth = 5
-        ctx.setLineDash([10, 6])
-        ctx.beginPath()
-        ctx.moveTo(fromX, fromY)
-        ctx.lineTo(toX, toY)
-        ctx.stroke()
-        const angle = Math.atan2(toY - fromY, toX - fromX)
-        const headSize = 14
-        ctx.beginPath()
-        ctx.moveTo(toX, toY)
-        ctx.lineTo(toX - headSize * Math.cos(angle - Math.PI / 6), toY - headSize * Math.sin(angle - Math.PI / 6))
-        ctx.lineTo(toX - headSize * Math.cos(angle + Math.PI / 6), toY - headSize * Math.sin(angle + Math.PI / 6))
-        ctx.closePath()
-        ctx.fill()
-        ctx.restore()
-      }
-
-      if (lowerLabel.includes('contact')) {
-        drawArrow(width * 0.12, height * 0.72, centerX, centerY + height * 0.05, '#57FF00')
-      } else if (lowerLabel.includes('ready')) {
-        drawArrow(width * 0.82, height * 0.22, centerX - width * 0.05, centerY - height * 0.02, '#57FF00')
-      } else if (lowerLabel.includes('recovery')) {
-        drawArrow(width * 0.18, height * 0.22, centerX - width * 0.1, centerY + height * 0.12, '#57FF00')
-      } else {
-        drawArrow(width * 0.1, height * 0.7, centerX - width * 0.06, centerY + height * 0.05, '#57FF00')
-      }
-
-      ctx.save()
-      ctx.fillStyle = 'rgba(87,255,0,0.18)'
-      ctx.strokeStyle = '#57FF00'
-      ctx.lineWidth = 4
-      const paddleX = width * 0.68
-      const paddleY = height * 0.18
-      const paddleW = width * 0.18
-      const paddleH = height * 0.08
-      ctx.fillRect(paddleX, paddleY, paddleW, paddleH)
-      ctx.strokeRect(paddleX, paddleY, paddleW, paddleH)
-      ctx.restore()
-
-      ctx.save()
-      ctx.font = `500 ${Math.max(14, Math.round(width * 0.025))}px Inter, sans-serif`
-      ctx.fillStyle = '#57FF00'
-      ctx.fillText('Paddle', paddleX + 10, paddleY + 10)
-      ctx.restore()
-
-      if (lowerLabel.includes('recovery') || lowerLabel.includes('footwork')) {
-        ctx.save()
-        ctx.fillStyle = 'rgba(255,69,0,0.16)'
-        ctx.strokeStyle = '#FF4500'
-        ctx.lineWidth = 5
-        ctx.fillRect(width * 0.28, height * 0.7, width * 0.34, height * 0.16)
-        ctx.strokeRect(width * 0.28, height * 0.7, width * 0.34, height * 0.16)
-        ctx.restore()
-        drawArrow(width * 0.48, height * 0.62, width * 0.48, height * 0.82, '#FF4500')
-      }
-
-      resolve(canvas.toDataURL('image/jpeg', 0.82))
-    }
-
-    img.onerror = () => {
-      reject(new Error('Failed to load frame image for annotation'))
-    }
-
-    img.src = frame.src
-  })
+// Parse structured coach response into sections
+function validScore(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 1 && value <= 10 ? value : null
 }
 
-// Parse structured coach response into sections
 function normalizeVideoFeedback(raw: Partial<Feedback>): Feedback {
   const scoreBreakdown = {
-    footwork: Number(raw.scoreBreakdown?.footwork ?? 0),
-    positioning: Number(raw.scoreBreakdown?.positioning ?? 0),
-    paddlePrep: Number(raw.scoreBreakdown?.paddlePrep ?? 0),
-    timing: Number(raw.scoreBreakdown?.timing ?? 0),
-    consistency: Number(raw.scoreBreakdown?.consistency ?? 0),
+    footwork: validScore(raw.scoreBreakdown?.footwork),
+    positioning: validScore(raw.scoreBreakdown?.positioning),
+    paddlePrep: validScore(raw.scoreBreakdown?.paddlePrep),
+    timing: validScore(raw.scoreBreakdown?.timing),
+    consistency: validScore(raw.scoreBreakdown?.consistency),
   }
 
-  const validScores = Object.values(scoreBreakdown).filter((score) => score > 0)
+  const validScores = Object.values(scoreBreakdown).filter((score): score is number => score !== null)
 
   const score =
     validScores.length > 0
       ? Math.round(validScores.reduce((sum, score) => sum + score, 0) / validScores.length)
-      : Number(raw.score ?? 0)
+      : validScore(raw.score)
 
   return {
     diagnosis: raw.diagnosis || 'No technical diagnosis was returned.',
@@ -232,11 +102,11 @@ function normalizeVideoFeedback(raw: Partial<Feedback>): Feedback {
     contactPoint: raw.contactPoint || '',
     recoveryStep: raw.recoveryStep || '',
     biggestIssue: raw.biggestIssue || 'No primary issue was returned.',
-    improveFirst: raw.improveFirst || 'Focus on clean contact, balanced footwork, and faster recovery.',
+    improveFirst: raw.improveFirst || 'Not enough evidence to recommend a correction.',
     drills: Array.isArray(raw.drills) ? raw.drills : [],
     score,
     scoreBreakdown,
-    scoreExplanation: raw.scoreExplanation || 'The score reflects the visible balance, positioning, paddle preparation, timing, and consistency shown in the analyzed frames.',
+    scoreExplanation: raw.scoreExplanation || 'Not enough evidence for an explanation.',
     frames: raw.frames || [],
   }
 }
@@ -250,7 +120,6 @@ export default function VideoReviewPage() {
   const [status, setStatus] = useState<'idle' | 'analyzing' | 'error'>('idle')
   const [error, setError] = useState('')
   const [feedback, setFeedback] = useState<Feedback | null>(null)
-  const [annotatedFrames, setAnnotatedFrames] = useState<AnnotatedFrame[]>([])
   const [profile, setProfile] = useState<UserProfile>({ skillLevel: 'Intermediate', dominantHand: 'Right', playStyle: 'Balanced', goals: ['Improve consistency'], weaknesses: [] })
 
   const targetPlayerOptions: { value: TargetPlayerSelection; label: string }[] = [
@@ -290,36 +159,6 @@ export default function VideoReviewPage() {
     }
   }, [])
 
-  useEffect(() => {
-    let active = true
-    async function annotateFrames() {
-      if (!feedback?.frames?.length) {
-        setAnnotatedFrames([])
-        return
-      }
-
-      const results = await Promise.all(
-        feedback.frames.map(async (frame) => {
-          try {
-            const annotatedSrc = await createAnnotatedSrc(frame)
-            return { ...frame, annotatedSrc }
-          } catch {
-            return { ...frame, annotationError: 'Annotation unavailable' }
-          }
-        })
-      )
-
-      if (active) {
-        setAnnotatedFrames(results)
-      }
-    }
-
-    annotateFrames()
-    return () => {
-      active = false
-    }
-  }, [feedback?.frames])
-
   const goalsText = useMemo(() => {
     if (!profile.goals?.length) return 'general improvement'
     return profile.goals.join(', ')
@@ -357,7 +196,7 @@ export default function VideoReviewPage() {
       formData.append('targetPlayerSelection', targetPlayerSelection)
       formData.append('targetPlayerDescription', buildTargetPlayerDescription())
       formData.append('userProfile', JSON.stringify(profile))
-      const sentCoachingBiomechanics = videoFile
+      const sentCoachingBiomechanics = videoFile && process.env.NODE_ENV !== 'production'
         ? appendVideoBiomechanics(formData, videoFile, () => window.localStorage)
         : null
       if (process.env.NODE_ENV !== 'production') {
@@ -556,11 +395,12 @@ export default function VideoReviewPage() {
                     <div className="flex items-center gap-2">
                       <span className="text-sm text-slate-400">Overall Score:</span>
                       <div className={`px-3 py-1 rounded-full text-sm font-semibold ${
-                        feedback.score >= 8 ? 'bg-green-500/20 text-green-400' :
-                        feedback.score >= 6 ? 'bg-yellow-500/20 text-yellow-400' :
+                        feedback.score === null ? 'bg-slate-500/20 text-slate-300' :
+                            (feedback.score ?? 0) >= 8 ? 'bg-green-500/20 text-green-400' :
+                        (feedback.score ?? 0) >= 6 ? 'bg-yellow-500/20 text-yellow-400' :
                         'bg-red-500/20 text-red-400'
                       }`}>
-                        {`${feedback.score}/10`}
+                        {feedback.score === null ? 'N/A — Not enough evidence' : `${feedback.score}/10`}
                       </div>
                     </div>
                   </div>
@@ -571,51 +411,56 @@ export default function VideoReviewPage() {
                       <div className="grid grid-cols-5 gap-2 p-4 bg-[#0B1321]/[0.85] border border-white/5 rounded-lg">
                         <div className="flex flex-col items-center">
                           <div className={`w-12 h-12 rounded-full flex items-center justify-center font-bold text-sm ${
-                            feedback.scoreBreakdown.footwork >= 8 ? 'bg-green-500/20 text-green-400' :
-                            feedback.scoreBreakdown.footwork >= 6 ? 'bg-yellow-500/20 text-yellow-400' :
+                            feedback.scoreBreakdown.footwork === null ? 'bg-slate-500/20 text-slate-300' :
+                            (feedback.scoreBreakdown.footwork ?? 0) >= 8 ? 'bg-green-500/20 text-green-400' :
+                            (feedback.scoreBreakdown.footwork ?? 0) >= 6 ? 'bg-yellow-500/20 text-yellow-400' :
                             'bg-red-500/20 text-red-400'
                           }`}>
-                            {feedback.scoreBreakdown.footwork}
+                            {feedback.scoreBreakdown.footwork ?? 'N/A'}
                           </div>
                           <p className="text-[0.65rem] uppercase text-slate-400 mt-1 text-center tracking-wide">Footwork</p>
                         </div>
                         <div className="flex flex-col items-center">
                           <div className={`w-12 h-12 rounded-full flex items-center justify-center font-bold text-sm ${
-                            feedback.scoreBreakdown.positioning >= 8 ? 'bg-green-500/20 text-green-400' :
-                            feedback.scoreBreakdown.positioning >= 6 ? 'bg-yellow-500/20 text-yellow-400' :
+                            feedback.scoreBreakdown.positioning === null ? 'bg-slate-500/20 text-slate-300' :
+                            (feedback.scoreBreakdown.positioning ?? 0) >= 8 ? 'bg-green-500/20 text-green-400' :
+                            (feedback.scoreBreakdown.positioning ?? 0) >= 6 ? 'bg-yellow-500/20 text-yellow-400' :
                             'bg-red-500/20 text-red-400'
                           }`}>
-                            {feedback.scoreBreakdown.positioning}
+                            {feedback.scoreBreakdown.positioning ?? 'N/A'}
                           </div>
                           <p className="text-[0.65rem] uppercase text-slate-400 mt-1 text-center tracking-wide">Position</p>
                         </div>
                         <div className="flex flex-col items-center">
                           <div className={`w-12 h-12 rounded-full flex items-center justify-center font-bold text-sm ${
-                            feedback.scoreBreakdown.paddlePrep >= 8 ? 'bg-green-500/20 text-green-400' :
-                            feedback.scoreBreakdown.paddlePrep >= 6 ? 'bg-yellow-500/20 text-yellow-400' :
+                            feedback.scoreBreakdown.paddlePrep === null ? 'bg-slate-500/20 text-slate-300' :
+                            (feedback.scoreBreakdown.paddlePrep ?? 0) >= 8 ? 'bg-green-500/20 text-green-400' :
+                            (feedback.scoreBreakdown.paddlePrep ?? 0) >= 6 ? 'bg-yellow-500/20 text-yellow-400' :
                             'bg-red-500/20 text-red-400'
                           }`}>
-                            {feedback.scoreBreakdown.paddlePrep}
+                            {feedback.scoreBreakdown.paddlePrep ?? 'N/A'}
                           </div>
                           <p className="text-[0.65rem] uppercase text-slate-400 mt-1 text-center tracking-wide">Paddle</p>
                         </div>
                         <div className="flex flex-col items-center">
                           <div className={`w-12 h-12 rounded-full flex items-center justify-center font-bold text-sm ${
-                            feedback.scoreBreakdown.timing >= 8 ? 'bg-green-500/20 text-green-400' :
-                            feedback.scoreBreakdown.timing >= 6 ? 'bg-yellow-500/20 text-yellow-400' :
+                            feedback.scoreBreakdown.timing === null ? 'bg-slate-500/20 text-slate-300' :
+                            (feedback.scoreBreakdown.timing ?? 0) >= 8 ? 'bg-green-500/20 text-green-400' :
+                            (feedback.scoreBreakdown.timing ?? 0) >= 6 ? 'bg-yellow-500/20 text-yellow-400' :
                             'bg-red-500/20 text-red-400'
                           }`}>
-                            {feedback.scoreBreakdown.timing}
+                            {feedback.scoreBreakdown.timing ?? 'N/A'}
                           </div>
                           <p className="text-[0.65rem] uppercase text-slate-400 mt-1 text-center tracking-wide">Timing</p>
                         </div>
                         <div className="flex flex-col items-center">
                           <div className={`w-12 h-12 rounded-full flex items-center justify-center font-bold text-sm ${
-                            feedback.scoreBreakdown.consistency >= 8 ? 'bg-green-500/20 text-green-400' :
-                            feedback.scoreBreakdown.consistency >= 6 ? 'bg-yellow-500/20 text-yellow-400' :
+                            feedback.scoreBreakdown.consistency === null ? 'bg-slate-500/20 text-slate-300' :
+                            (feedback.scoreBreakdown.consistency ?? 0) >= 8 ? 'bg-green-500/20 text-green-400' :
+                            (feedback.scoreBreakdown.consistency ?? 0) >= 6 ? 'bg-yellow-500/20 text-yellow-400' :
                             'bg-red-500/20 text-red-400'
                           }`}>
-                            {feedback.scoreBreakdown.consistency}
+                            {feedback.scoreBreakdown.consistency ?? 'N/A'}
                           </div>
                           <p className="text-[0.65rem] uppercase text-slate-400 mt-1 text-center tracking-wide">Const.</p>
                         </div>
@@ -731,8 +576,8 @@ export default function VideoReviewPage() {
                     <div>
                       <h4 className="font-semibold text-[#57FF00] text-sm uppercase tracking-wider mb-4">Analyzed Frames</h4>
                       <div className="space-y-4">
-                        {((annotatedFrames.length ? annotatedFrames : feedback.frames) as AnnotatedFrame[]).map((frame) => (
-                          <div key={frame.label} className="grid gap-4 rounded-[1.5rem] border border-white/10 bg-[#091014]/[0.85] p-4 shadow-[0_20px_80px_-50px_rgba(87,255,0,0.45)] sm:grid-cols-2">
+                        {feedback.frames.map((frame) => (
+                          <div key={frame.label} className="grid gap-4 rounded-[1.5rem] border border-white/10 bg-[#091014]/[0.85] p-4 shadow-[0_20px_80px_-50px_rgba(87,255,0,0.45)] ">
                             <div className="space-y-2">
                               <div className="flex items-center justify-between">
                                 <span className="text-[0.65rem] uppercase tracking-[0.22em] text-slate-400">Original Frame</span>
@@ -742,31 +587,9 @@ export default function VideoReviewPage() {
                                 <img
                                   src={frame.src}
                                   alt={`Original ${frame.label}`}
-                                  className="h-64 w-full object-cover"
+                                  className="h-64 w-full object-contain"
                                   loading="lazy"
                                 />
-                              </div>
-                            </div>
-                            <div className="space-y-2">
-                              <div className="flex items-center justify-between">
-                                <span className="text-[0.65rem] uppercase tracking-[0.22em] text-slate-400">Annotated Frame</span>
-                                {frame.annotationError ? (
-                                  <span className="text-[0.65rem] text-red-400">Annotation unavailable</span>
-                                ) : null}
-                              </div>
-                              <div className="overflow-hidden rounded-3xl border border-white/10 bg-[#081013]">
-                                {frame.annotatedSrc ? (
-                                  <img
-                                    src={frame.annotatedSrc}
-                                    alt={`Annotated ${frame.label}`}
-                                    className="h-64 w-full object-cover"
-                                    loading="lazy"
-                                  />
-                                ) : (
-                                  <div className="flex h-64 items-center justify-center px-4 text-center text-sm text-slate-400">
-                                    Annotation not available for this frame.
-                                  </div>
-                                )}
                               </div>
                             </div>
                           </div>
